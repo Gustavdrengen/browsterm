@@ -21,6 +21,14 @@
     </header>
 
     <main class="workspace">
+      <aside class="sidebar" aria-label="Files">
+        <header class="sidebar-tools">
+          <span id="fs-status" class="muted">…</span>
+          <button type="button" id="fs-refresh" title="Refresh">↻</button>
+        </header>
+        <nav id="breadcrumbs" class="breadcrumbs" aria-label="Path"></nav>
+        <div id="entries" class="entries" role="list"></div>
+      </aside>
       <section class="pane is-active" id="t1">
         <div class="terminal-host" id="term"></div>
       </section>

@@ -131,6 +131,29 @@ The agent appends a dated entry here after every state-of-play gate. The section
 
 <!-- State-of-play entries inserted below. -->
 
+#### - [2026-06-17] Tier-2 file-explorer sidebar UI
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` (no warnings) + `cargo test --release` (15/15 pass, +1 for `list_endpoint_defaults_to_cwd_when_path_empty`).
+  - Workspace layout rebuilt as `flex`: `.sidebar { flex: 0 0 240px }` + `.pane { flex: 1 1 auto }`. The terminal pane still owns the right-of-sidebar region; the topbar/statusbar rows are unchanged.
+  - `src/static/app.js` ships a sidebar IIFE: 5-second polling tick (paused on `document.visibilityState !== "visible"`, stopped on `pagehide`). Initial `navigate(".")` hits the Rust cwd default.
+  - Race-safe navigate: each call takes an `inFlight` ticket; stale responses after a newer click are dropped before any DOM mutation, so rapid folder hops never paint an out-of-order listing.
+  - Folders are click-to-navigate. Files render in the disabled visual state (no hover, muted opacity, cursor: default, tooltip "Preview pane ships in Commit D") so the affordance stays honest while the preview pane is not yet wired.
+  - Symlinks are visually distinct: italic accent name + `U+2192` + target path with `text-overflow: ellipsis` so long targets can't push the row past the 240px column. `.entries` has `overflow-x: hidden` as the second line of defence.
+  - Embedded `index.html` `/app.js` `/app.css` confirmed post-edit via curl on `/workspace/assets`: `/app.js` has the `navigate / renderBreadcrumbs / renderEntries / pagehide / setInterval(/ is-file.is-disabled` markers; `/app.css` has the new `.sidebar / .breadcrumbs / .fs-row / .fs-meta` selectors.
+
+- **Broken / rough / missing** (user-visible):
+  - **Clicking a file does nothing** until Commit D lands. The disabled visual state is the contract for now.
+  - **No hidden-file toggle** (vision §2 explicit feature). MVP shows hidden files by default; a future polish commit adds the toggle.
+  - **No recursive tree expansion.** Flat list + breadcrumbs is the MVP; recursive depth-first expansion ships later.
+  - **No keyboard navigation** for the sidebar (arrow keys, Enter to open, Esc to go up). Tier-3 polish.
+  - **No shared cwd pointer** between the sidebar and the active terminal pane. vision §2 wants the terminal cwd known to the workspace so "opening the project I'm in" takes one click; that's a Tier-2 follow-up.
+
+- **Feels bad** (code is there but a user would notice):
+  - `fs-error` rows render as plain text; a future polish pass adds a tinted background so they don't blend with normal entries.
+
+> **Decision:** Ship the sidebar separately from the preview pane so each commit has a tight surface; the disabled-file affordance is honest about the missing seam. **Tier:** T2. **Evidence:** 15 passing unit tests; `curl` confirms the embedded assets contain the sidebar IIFE + new CSS selectors; the Bash binary boots clean on a fresh port with the post-edit assets served. **Trade-off:** until Commit D, file rows are visually inert; the tooltip + tooltip-style muted state is the load-bearing contract.
+
 #### - [2026-06-17] Tier-2 file-explorer backend
 
 - **Works** (verifiable as a user would experience it):

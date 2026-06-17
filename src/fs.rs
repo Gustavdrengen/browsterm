@@ -103,8 +103,19 @@ impl IntoResponse for FsError {
 }
 
 /// `GET /api/fs/list?path=...` — list one directory.
+///
+/// If `path` is empty, the listing defaults to the binary's current
+/// working directory — the same place the user typed `browsterm` from.
 pub async fn list(Query(req): Query<FsRequest>) -> Result<Json<ListResponse>, FsError> {
-    let raw = sanitize_path(&req.path)?;
+    let path_str = if req.path.is_empty() {
+        std::env::current_dir()
+            .map_err(|e| FsError::Internal(format!("cwd resolution: {e}")))?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        req.path
+    };
+    let raw = sanitize_path(&path_str)?;
     let canonical = tokio::task::spawn_blocking(move || std::fs::canonicalize(&raw))
         .await
         .map_err(|e| FsError::Internal(format!("blocking join: {e}")))?
@@ -373,5 +384,24 @@ mod tests {
         std::fs::write(&f, b"hi").unwrap();
         let bytes = read_file_bytes(f, 8 * 1024).unwrap();
         assert_eq!(bytes, b"hi");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_endpoint_defaults_to_cwd_when_path_empty() {
+        // The doc on `list` promises an empty `path` defaults to the process
+        // cwd; the test impersonates that contract by chdir-ing into a
+        // tempdir and asking for an empty path.
+        use axum::extract::Query;
+        let dir = make_temp_layout();
+        let saved = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let outcome = list(Query(FsRequest {
+            path: String::new(),
+        }))
+        .await;
+        std::env::set_current_dir(&saved).unwrap();
+        let Json(body) = outcome.expect("empty-path list should succeed");
+        let names: Vec<&str> = body.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Folder", ".hidden", "A_file.txt", "z_file.txt"]);
     }
 }
