@@ -109,6 +109,14 @@ body {
   color: #3fb950;
 }
 
+#conn.reconnecting {
+  color: #d29922;
+}
+
+#conn.error {
+  color: #f85149;
+}
+
 .spacer {
   flex: 1;
 }

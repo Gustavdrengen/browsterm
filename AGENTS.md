@@ -131,6 +131,28 @@ The agent appends a dated entry here after every state-of-play gate. The section
 
 <!-- State-of-play entries inserted below. -->
 
+#### - [2026-06-17] Reconnect Tier-1 fix
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` and `cargo test --release` still pass; all 5 unit tests (terminal envelope × 3, pty round-trip × 2) green.
+  - Smoke (`./target/release/browsterm --no-browser --port 8768` then `curl`): `/healthz` → `ok`, `/` → 200, `/app.js` → 200, `/app.css` → 200. Tail of `/app.js` shows the new `reconnectTimer` / `pagehide` paths; `/app.css` shows the new `#conn.connected` / `#conn.reconnecting` / `#conn.error` color rules.
+  - WS now self-heals: `close`/`error` schedule a fresh socket with capped exponential backoff (250 ms → 30 s) plus ≤ 25%-of-delay jitter (capped at 1 s); on `open` the client refits the terminal + sends a `resize` envelope. Status bar shows a live countdown in amber (`"disconnected — reconnecting (attempt N) in Xs…"`). xterm scrollback is preserved across the transition; the resize-driven prompt re-emit (already documented in `pty.rs`) gives the user a visible prompt before the second paint.
+  - Stopped-on-pagehide: `pagehide` flips a `stopped` flag, clears the pending timer, and closes the socket; the `open` handler also guards against `stopped` so a tab being torn down during an in-flight connect cannot briefly flash "connected".
+
+- **Broken / rough / missing** (user-visible):
+  - **Vision §2 backlog** still open: no file explorer, no splits/tabs/tear-off, no bookmarks/themes/clipboard image flow, no CSV/image/PDF preview, no remote/encrypted mode, no PWA phone-mode polish.
+  - **No Rust integration test** exercising the multiple-WS-upgrade lifecycle end-to-end. The change is purely client-side and existing Rust tests still pass; such a test would require an axum-in-process broker harness. Logged here as a Tier-3 harden.
+  - WS auto-reconnect spawns a fresh PTY on every reconnect. In-flight output of a long-running pipe is gone, but the prompt comes back on the first paint. Acceptable; matches vision principle #6.
+  - Banner-heavy shells still flash briefly before the first `resize` lands (carries forward from foundation commit).
+  - No SRI on the two CDN script tags (existing TODO, Tier 3).
+  - No Origin / Host validation on `/ws` (loopback-only today).
+
+- **Feels bad** (code is there but a user would notice):
+  - On long outages the status bar does the talking; the rest of the workspace reads as healthy. That is the *intended* invariant. Leave it.
+  - Within one reconnect tick, the status text flips once from the `error` handler's `"disconnected — reconnecting…"` to the `close` handler's `"disconnected — reconnecting (attempt N) in Xs…"`. Eye won't catch it; could be unified behind a single source of truth later.
+
+> **Decision:** Auto-reconnect lives in the browser only; the server treats every `/ws` connect as a fresh PtySession and the previous session's `terminal::run` task shuts the old shell down via `pty_arc.shutdown()` on its own drop. **Tier:** T1. **Evidence:** state-of-play bullet above + `terminal::run`'s drop-finalizer. **Trade-off:** no per-tab rate limit on new PTYs; a hot reconnect storm can briefly spawn many shells. Server-side backpressure is owed a Tier-3 harden before this becomes a problem.
+
 #### - [2026-06-17] Foundation commit
 
 - **Works** (verifiable as a user would experience it):
