@@ -131,6 +131,27 @@ The agent appends a dated entry here after every state-of-play gate. The section
 
 <!-- State-of-play entries inserted below. -->
 
+#### - [2026-06-17] Tier-2 file-explorer backend
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` (no warnings) + `cargo test --release` (14/14 pass, +7 from `fs`): `sanitize_path_rejects_nul_bytes`, `sanitize_path_rejects_empty_input`, `sort_layout_dirs_first_then_files_case_insensitive_no_follow`, `symlinks_are_listed_with_target_not_followed`, `circular_symlinks_do_not_hang_listing`, `read_file_bytes_rejects_oversize` (1 KiB cap, fast), `read_file_bytes_rejects_symlink`, `read_file_bytes_accepts_small_file`.
+  - `GET /api/fs/list?path=...` returns JSON `{path, entries:[{name,is_dir,is_file,is_symlink,size,mtime_secs?,mime?,symlink_target?}]}`. Sort: directories first, then case-insensitive alphabetical. Hidden files visible by default. Symlinks carry `is_symlink:true` and `symlink_target`, never resolved.
+  - `GET /api/fs/file?path=...` returns raw bytes with the correct `Content-Type`, capped at 8 MiB. Symlink chains resolve through `std::fs::canonicalize`; a symlink whose *canonicalised* form is still a symlink is refused with a `BadRequest`. Per the doc comment on the handler, the file endpoint matches the user's terminal visibility on the same socket, exactly like the rest of the workspace.
+  - Uniform `{error:{code,message}}` JSON envelope with HTTP codes 400/403/404/500 mapped to `bad_request` / `forbidden` / `not_found` / `internal`.
+  - Smoke (`./target/release/browsterm --no-browser --port 8769`): `/healthz` ok; `/api/fs/list?path=/tmp/.../smoke` returned `{... entries: [{name: "abc.txt", is_file:true, mime:"text/plain"...}, {name: "link.txt", is_symlink:true, symlink_target:"abc.txt"…}, {name: "sub", is_dir:true…}]}`; `/api/fs/file?path=.../abc.txt` returned the bytes; `/api/fs/list?path=/no/such/path` returned 404 + `{"error":{"code":"not_found","message":"path not found"}}`.
+
+- **Broken / rough / missing** (user-visible):
+  - **Sidebar UI not yet wired.** The endpoints are reachable but visually orphaned until the next commit. Vision §2 still wants the tree, breadcrumbs, command palette, hidden-file toggle, sortable columns, hover previews.
+  - **No preview pane.** Today `/api/fs/file` serves bytes; the browser does the right thing for inline images and downloads but we don't yet have a syntax-highlighted text view, sortable CSV table, or hex fallback.
+  - **No Range support** on `/api/fs/file`; an oversized file is rejected wholesale, not chunked. Tier-3 follow-up.
+  - **No `--fs-max-bytes` CLI flag.** Cap is hard-coded at 8 MiB. Tier-3 follow-up.
+  - **No integration test** that exercises the deferred-spawn protocol over an axum-in-process `/ws`. Carried forward from the deferred-spawn commit.
+
+- **Feels bad** (code is there but a user would notice):
+  - The two endpoints have deliberately different symlink semantics (see doc on `fs::file`). A future author might assume they're symmetric; the in-file comment is the load-bearing thing that prevents that mistake.
+
+> **Decision:** Ship the listing + file endpoints first; defer the sidebar UI to the next commit so each commit's scope stays small. **Tier:** T2. **Evidence:** 14 unit tests + an end-to-end smoke run reproducing the contract against `/tmp` fixtures. **Trade-off:** until the next commit ships the sidebar, the user can curl the endpoints but not see them in the browser; that gap is acceptable for a single-commit cycle.
+
 #### - [2026-06-17] Defer PTY spawn to client dims (Tier 1)
 
 - **Works** (verifiable as a user would experience it):

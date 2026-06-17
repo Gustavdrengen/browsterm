@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 mod assets;
 mod browser;
 mod config;
+mod fs;
 mod pty;
 mod server;
 mod terminal;

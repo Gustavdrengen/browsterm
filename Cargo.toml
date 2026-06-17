@@ -44,3 +44,6 @@ rand = "0.8"
 opt-level = 3
 lto = "thin"
 strip = "symbols"
+
+[dev-dependencies]
+tempfile = "3.27.0"

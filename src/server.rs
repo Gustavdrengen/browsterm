@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use crate::assets::ServerAssets;
+use crate::fs;
 use crate::terminal;
 
 /// Shared state passed to every request. Currently just enough for the WS handler.
@@ -50,6 +51,8 @@ fn router(state: ServerState) -> Router {
     Router::new()
         .route("/", get(serve_root))
         .route("/healthz", get(health))
+        .route("/api/fs/list", get(fs::list))
+        .route("/api/fs/file", get(fs::file))
         .route("/{*path}", get(serve_asset))
         .route("/ws", get(ws_upgrade))
         .with_state(state)
