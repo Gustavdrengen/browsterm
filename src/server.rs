@@ -7,12 +7,10 @@ use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use futures_util::SinkExt;
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::assets::ServerAssets;
-use crate::pty::PtySession;
 use crate::terminal;
 
 /// Shared state passed to every request. Currently just enough for the WS handler.
@@ -108,18 +106,10 @@ async fn ws_upgrade(
 ) -> Response {
     let shell = state.shell().to_string();
     let args = state.shell_args().to_vec();
-    ws.on_upgrade(move |mut socket| async move {
-        // Spawn the PTY first; if it fails we close the WS cleanly so the
-        // browser sees a Close frame instead of hanging on a 101'd connection.
-        // The failure reason is logged in the binary log (operator-visible).
-        let pty = match PtySession::spawn(&shell, &args, None, 80, 24) {
-            Ok(pty) => pty,
-            Err(err) => {
-                warn!(error = ?err, "could not spawn PTY for new connection");
-                let _ = socket.close().await;
-                return;
-            }
-        };
-        terminal::run(socket, pty).await;
+    ws.on_upgrade(move |socket| async move {
+        // Defer PTY spawn until the client sends a `Ready` envelope with its
+        // terminal cell grid, so the shell starts at the user's actual size
+        // and never paints a banner at the wrong width for one frame.
+        terminal::run(socket, shell, args).await;
     })
 }

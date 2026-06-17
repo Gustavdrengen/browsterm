@@ -10,21 +10,65 @@ use crate::pty::PtySession;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum ClientMessage {
-    /// Browser reports its current terminal cell size.
+    /// Browser reports its terminal cell size and asks the server to spawn
+    /// the PTY at those dimensions. This is the first envelope a client is
+    /// expected to send; everything sent before it is discarded.
+    Ready { cols: u16, rows: u16 },
+    /// Browser reports a subsequent terminal size change.
     Resize { cols: u16, rows: u16 },
     /// Browser sends a raw paste (copy-mode drag-and-drop fallback).
     Input { data: String },
 }
 
 /// Run a single terminal session over `socket` until either side closes.
-pub async fn run(socket: WebSocket, pty: PtySession) {
-    if let Err(err) = run_inner(socket, pty).await {
+///
+/// The PTY is not spawned until the client sends a `Ready` envelope carrying
+/// its actual column/row dims. This eliminates the banner-flash Tier-1 bug:
+/// before this, the PTY was spawned at the static 80x24 fallback before the
+/// browser reported its real dims, so banner-heavy shells painted at the
+/// wrong size for a single repaint cycle before the resize-driven prompt
+/// re-emit rescued the user.
+pub async fn run(socket: WebSocket, shell: String, args: Vec<String>) {
+    if let Err(err) = run_inner(socket, shell, args).await {
         warn!(error = ?err, "terminal session ended with error");
     }
 }
 
-async fn run_inner(socket: WebSocket, pty: PtySession) -> Result<()> {
+async fn run_inner(socket: WebSocket, shell: String, args: Vec<String>) -> Result<()> {
     let (mut sender, mut receiver) = socket.split();
+
+    // Wait for the client's `Ready` envelope so we spawn the PTY at the
+    // browser's actual grid size. Anything sent before `Ready` is ignored.
+    let (cols, rows) = loop {
+        match receiver.next().await {
+            Some(Ok(Message::Text(text))) => match serde_json::from_str::<ClientMessage>(&text) {
+                Ok(ClientMessage::Ready { cols, rows }) => {
+                    break (cols.max(1), rows.max(1));
+                }
+                Ok(_) => debug!("ignoring non-Ready envelope before Ready"),
+                Err(_) => debug!("ignoring unparseable text before Ready"),
+            },
+            Some(Ok(Message::Binary(_))) => {
+                debug!("ignoring binary frame before Ready");
+            }
+            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                debug!("client disconnected before sending Ready");
+                let _ = sender.send(Message::Close(None)).await;
+                return Ok(());
+            }
+        }
+    };
+
+    let pty = match PtySession::spawn(&shell, &args, None, cols, rows) {
+        Ok(pty) => pty,
+        Err(err) => {
+            warn!(error = ?err, "PTY spawn failed after client Ready");
+            let _ = sender.send(Message::Close(None)).await;
+            return Ok(());
+        }
+    };
+
     let mut pty_bytes = pty.subscribe();
 
     // Pump 1: PTY bytes -> browser (binary frames, no UTF-8 lossy conversion).
@@ -46,6 +90,12 @@ async fn run_inner(socket: WebSocket, pty: PtySession) -> Result<()> {
             };
             match msg {
                 Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(ClientMessage::Ready { cols, rows }) => {
+                        debug!(cols, rows, "late Ready; forwarding as resize");
+                        if let Err(err) = pty_arc.resize(cols, rows).await {
+                            warn!(error = ?err, "PTY resize failed");
+                        }
+                    }
                     Ok(ClientMessage::Resize { cols, rows }) => {
                         debug!(cols, rows, "client resize");
                         if let Err(err) = pty_arc.resize(cols, rows).await {
@@ -105,6 +155,21 @@ mod tests {
             ClientMessage::Resize { cols, rows } => {
                 assert_eq!(cols, 120);
                 assert_eq!(rows, 40);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn ready_envelope_parses() {
+        // The first envelope a client is required to send. Spawn dims come
+        // straight from the browser-reported cell grid.
+        let parsed: ClientMessage =
+            serde_json::from_str(r#"{"type":"ready","cols":132,"rows":50}"#).unwrap();
+        match parsed {
+            ClientMessage::Ready { cols, rows } => {
+                assert_eq!(cols, 132);
+                assert_eq!(rows, 50);
             }
             _ => panic!("wrong variant"),
         }

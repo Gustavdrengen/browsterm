@@ -117,10 +117,11 @@
       if (fitAddon) fitAddon.fit();
       const { cols, rows } = reportDims();
       dims.textContent = `${cols}×${rows}`;
-      // Each WS connect is a fresh PTY; the resize triggers the shell to
-      // re-emit its prompt, so the user sees the new session starting
-      // without a manual refresh.
-      sendEnvelope({ type: "resize", cols, rows });
+      // The server treats the first envelope we send as the cue to spawn
+      // the PTY at our actual grid size. Sending `ready` (instead of
+      // `resize`) is what eliminates the banner-flash Tier-1 bug: the PTY
+      // never paints a frame at 80x24 before it is told the right dims.
+      sendEnvelope({ type: "ready", cols, rows });
       term.focus();
     });
 

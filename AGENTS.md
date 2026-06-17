@@ -131,6 +131,25 @@ The agent appends a dated entry here after every state-of-play gate. The section
 
 <!-- State-of-play entries inserted below. -->
 
+#### - [2026-06-17] Defer PTY spawn to client dims (Tier 1)
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` (no warnings) + `cargo test --release` (6/6 pass, including the new `ready_envelope_parses`).
+  - The WS protocol now requires the client's first envelope to be `{type:"ready", cols, rows}`; the PTY does not exist until the server receives it. Subsequent envelopes are still `resize` (TIOCSWINSZ) and `input` (PTY write). `src/static/app.js` sends `ready` on every open, including reconnects, so the lifecycle is uniform.
+  - Smoke (`./target/release/browsterm --no-browser --port 8768`): `/healthz` → `ok`, `/` → 200, `/app.js` → 200, `/app.css` → 200. Embedded `/app.js` line 124 sends `type:"ready"` on open; subsequent `type:"resize"` envelopes only fire on real size changes.
+  - The original Tier-1 bug ("PTY spawned at 80 × 24 before the browser reports real dims, so banner-heavy shells flash briefly") is no longer reachable: there is no PTY to paint anything before the browser reports its dims. Comments in `app.js` and `terminal.rs` call this out so the next editor does not undo it.
+
+- **Broken / rough / missing** (user-visible):
+  - **Vision §2 backlog** still open (file explorer, splits/tabs/tear-off, bookmarks/themes, drag-drop, WSL door polish, PWA phone-mode, doctor command).
+  - No axum-level integration test for the deferred-spawn contract. Unit tests cover envelope parse + PTY round-trip; a WS-lifecycle test needs an axum-in-process harness. Logged as the next Tier-3 harden.
+  - No SRI on the two CDN scripts (existing TODO).
+  - No Origin / Host validation on `/ws`.
+
+- **Feels bad** (code is there but a user would notice):
+  - On any pre-Ready noise from a misbehaving client (e.g. accidental binary frames before the first resize), the server logs only at `debug!` level. Misbehaving clients stay connected indefinitely until something closes the WS — by intentional choice; a hostile-client retry cap is a Tier-3 harden.
+
+> **Decision:** Server waits for first `Ready` envelope before constructing the PTY, rather than sending a `ready` signal from the server and letting the client start. **Tier:** T1. **Evidence:** state-of-play above + new test `terminal::tests::ready_envelope_parses`. **Trade-off:** the server emits no startup envelope; the next author has to know to send `ready` first. Intentional: it puts the source-of-truth for "what dims is the user looking at" on the browser side, which is the only place it can be measured accurately.
+
 #### - [2026-06-17] Reconnect Tier-1 fix
 
 - **Works** (verifiable as a user would experience it):
