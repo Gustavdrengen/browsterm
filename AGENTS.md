@@ -1,0 +1,204 @@
+# AGENTS.md — Browsterm Operating Manual
+
+> The repository operating manual for the Browsterm agent. Read end-to-end at the start of every session.
+
+## 1. Mission
+
+Browsterm is a single self-contained Rust binary that turns any Linux machine (laptop, server, Pi, dev VM, WSL) into a polished graphical terminal-and-files workspace that you drive from a browser. `VISION.md` is the source of truth for **what** Browsterm is and **who** it is for. This file is the source of truth for **how the agent works on it**.
+
+## 2. Role of `VISION.md`, `INBOX.md`, `BLOCKED.md`
+
+- `VISION.md` — user-owned. **Read-only** to the agent. Describes the product, audience, principles. Never rewritten, "improved," or reinterpreted without an explicit user instruction.
+- `INBOX.md` — programmer → agent. The agent reads it at every session start. Items are addressed, declined-with-reason, or escalated as a vision hole. Items removed when resolved — these files describe the current state, not history.
+- `BLOCKED.md` — agent → programmer. The agent writes here whenever it cannot proceed without external help (credentials, environment, vision-level decision it cannot reasonably make). Falls back to higher-tier work that does not need the unblock.
+
+A blank `INBOX.md` and `BLOCKED.md` are signs the agent is in a fully agent-executable environment.
+
+## 3. Decision hierarchy
+
+1. System and safety constraints.
+2. The user's direct instruction in the current conversation.
+3. `VISION.md`.
+4. `AGENTS.md`.
+5. Other repository docs (`docs/`, specs, READMEs).
+6. Existing code conventions.
+7. General best practice.
+
+In conflicts: vision wins over implementation details; current user instruction refines the current task; technical decisions are the agent's unless they materially change the vision.
+
+## 4. Autonomy model
+
+The agent **owns** — without asking — file layout, naming, formatting, linting, type-checks, test setup, build setup, documentation organization, internal workflow files, helper prompts, skills, reusable templates, scripts, automation, dependency choices for the chosen stack, and structural shape of the codebase.
+
+The agent **does not own** the user-facing product intent expressed in `VISION.md`. Vision-shaped changes require user confirmation.
+
+The agent **does not ask** the user to choose between approaches outside of (a) vision creation or modification, or (b) addressing an item in `INBOX.md` that genuinely needs clarification. Inside those two situations the agent asks the minimum required to remove the ambiguity. Outside them, the agent decides, briefly documents the decision inline (commit / code / this file), and keeps moving.
+
+## 5. Priority discipline and state-of-play gate
+
+### State-of-play gate (mandatory before choosing a task)
+
+Before selecting the next task — and again whenever work resumes after any break — the agent:
+
+1. Reads `INBOX.md` and `BLOCKED.md`. Processes open items per the cross-cutting-files contract.
+2. Builds and runs the project. Confirms it boots, runs, and exits cleanly.
+3. Exercises the product as a user would: opens the browser, types into the terminal, scrolls, resizes, closes.
+4. Writes a dated **State of play** entry in §10 below: what works, what is broken / rough / missing in a way a user would notice, and what is "there" but feels bad to use.
+
+The state-of-play note is the source of truth for what the product actually does today. Tests are evidence; the note is the truth.
+
+### Priority tiers (strict order)
+
+- **Tier 0 — Product is broken or unplayable.** Crashes on launch. Core loop doesn't function. UI blocks interaction. **Fix immediately.** Do not add features while a Tier 0 item exists.
+- **Tier 1 — Product is painful, empty, or unfaithful to vision.** Core loop works but is boring, punishing, or unrewarding; first ten seconds are not fun; key feature described in `VISION.md` is missing. Resolve before adding new content.
+- **Tier 2 — Missing capabilities explicitly in the vision.** Features the vision says the product should have that are not yet implemented. Resolve in vision order.
+- **Tier 3 — Polish, depth, nice-to-haves.** Visual polish, sound, additional content beyond the vision, refactors for elegance, performance tuning. Resolve opportunistically.
+
+Pick the **lowest-numbered** tier with unresolved items. Stay within the tier — promoting a Tier 3 task to skip Tier 0 or Tier 1 is forbidden.
+
+### Anti-patterns
+
+- "I'll add [feature] first because it's a natural next step" — features are not the default next step.
+- "The current implementation is rough, but my time is better spent on [new thing]" — almost always wrong; rough core is Tier 0/1, the new thing is Tier 2/3.
+- Adding auxiliary UI (menus, settings, dashboards, splash, on-boarding) while core experience is Tier 0/1.
+- Treating the test suite as proof the product works — the state-of-play note beats tests.
+
+## 6. Spec-driven development
+
+For non-trivial behavior, the agent writes or updates a spec before or alongside implementation. Specs live next to or below the module they govern:
+
+- Project-level: `VISION.md` (what) + `docs/architecture.md` (how the parts fit).
+- Module-level: in a `specs/` directory adjacent to the module, named after the module and its version.
+- Feature-level: for any feature that affects more than one file or has subtle invariants, write a short spec under `specs/<feature>.md`.
+
+Spec workflow for non-trivial changes:
+1. Identify the relevant spec scope.
+2. Create or update the spec before or alongside the implementation.
+3. Implement against the spec.
+4. Add or update tests derived from the spec.
+5. Validate that behavior matches the spec.
+6. Update the spec if the implementation decision legitimately changes the intended behavior.
+
+The state-of-play note is the source of truth for what the product does; the spec describes what it should do; the gap is the work.
+
+## 7. Testing and verification
+
+Testing is first-class, not a late-stage gate. Required by tier:
+
+- **Tier 0 fix** requires a regression test that fails on the broken version and passes on the fix.
+- **Tier 1 fix** requires a playtest observation recorded in the state-of-play note (or analogous user-exercise note) plus a regression test where applicable.
+- **Tier 2 feature** requires a test that fails before the feature and passes after, derived from the spec.
+
+Tier-bound requirements activate once the project has a build and a test runner (i.e., from "first runnable" onward). During bootstrap, the agent is creating the build and runner, not satisfying tier-based test requirements.
+
+Tests live next to the module they cover whenever practical (`#[cfg(test)] mod tests`); integration tests live in `tests/`. Verification commands live in this file's §9. Browsterm-specific extra: a playtest always complements a Tier 0/1 change — terminal fidelity is sacred.
+
+## 8. Commit policy
+
+The agent commits aggressively at well-defined checkpoints. A change is commit-ready when **all three** hold:
+
+- It compiles, type-checks, and the relevant test suite passes.
+- No previously-working functionality is broken.
+- The change can be described in one sentence.
+
+**Mandatory commit triggers**: after any new feature, bug fix, refactor/rename/reorg, spec/doc/`AGENTS.md` change, test update, dependency manifest change, build config change. Always before starting an unrelated task. Always before ending a session. A non-trivial session that ends with zero commits is a failure mode.
+
+**One logical change per commit.** A commit message that needs "and" in the headline is split. Tests, docs, config that belong with a code change share its commit. Re-run verification before each commit.
+
+The repository-local git identity is mandatory and derived from `VISION.md`'s project name:
+
+```
+git config user.name "Browsterm Agent"
+git config user.email "browsterm-agent@local"
+```
+
+## 9. Verification commands
+
+The standard local verification recipe:
+
+```
+cargo build --release
+cargo run --release -- --no-browser --port 8765
+# In a second terminal:
+curl http://127.0.0.1:8765/
+```
+
+For the agent's own self-test in a CI / headless context the same commands apply; a happy-path unit test in `src/terminal.rs::tests` exercises the WS protocol envelope.
+
+## 10. State of play
+
+The agent appends a dated entry here after every state-of-play gate. The section is capped at 10 entries; older entries are rotated out so trends stay visible without unbounded growth.
+
+<!-- State-of-play entries inserted below. -->
+
+#### - [2026-06-17] Foundation commit
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` produces the single `browsterm` binary (≈12 MB, `lto=thin` + `strip=symbols`).
+  - `cargo test --release` runs 5 unit tests, all pass in ~0.05 s:
+    - terminal.rs: JSON `resize` envelope parses, JSON `input` envelope parses, unknown `type` fails loudly.
+    - pty.rs: round-trip pump (write `echo READYMARK` → see the echo back through `subscribe`).
+    - pty.rs: late subscriber still receives bytes that arrive after `subscribe()`.
+  - `./target/release/browsterm --no-browser --port 8768` boots, binds `127.0.0.1`, prints the URL, then `curl http://127.0.0.1:8768/` returns the embedded `index.html` (1480 bytes, includes `<!DOCTYPE html>` + `xterm.js` script tag), `/app.js` and `/app.css` return 200 with their actual content, `/healthz` returns the literal string `ok`, and any other path returns the literal `not found` (404).
+  - Browser auto-opens to the URL on launch unless `--no-browser` is passed.
+  - PTY bridge: spawns `$SHELL` (or `/bin/sh` fallback) under `portable-pty` with `TERM=xterm-256color` + `COLORTERM=truecolor`; broadcast channel streams PTY bytes to the WS handler; resize forwards to the kernel via TIOCSWINSZ.
+  - WS protocol: client → server uses JSON envelopes `{type:"resize"|"input"}`; server → client uses binary frames carrying raw PTY bytes (so sixel/kitty graphic data survives the round trip untouched).
+  - WS handler close-on-spawn-failure path: a clean `socket.close().await` is sent when `portable-pty` cannot spawn the shell, and the failure reason lands in the binary log (`tracing::warn!`).
+
+- **Broken / rough / missing** (user-visible):
+  - **No file explorer.** Vision §2 explicit feature; not yet started.
+  - **No splits / tabs / tear-off.** Workspace is one pane, one tab.
+  - **No bookmarks / themes / clipboard image flow / CSV, image, PDF previews.** Vision §2 missing.
+  - **No remote / encrypted / authenticated mode.** Vision §2 friendliest goal post-cut.
+  - **No Rust integration test exercising the WS↔PTY bridge end-to-end.** We unit-test envelope parsing and PTY byte flow but not the axum-internal websocket plumbing.
+  - **No reconnect in `app.js`.** On WS close, the status bar says "disconnected — refresh to retry".
+  - **No `sha384` SRI pinned on the CDN scripts.** A TODO comment exists in `index.html`; jsDelivr is the only supply-chain attack surface right now.
+  - **No Origin / Host validation on `/ws`.** Acceptable for loopback; documented future-hardening.
+  - **Linux / WSL is the verified home.** macOS native + Windows ConPTY paths are not exercised yet.
+
+- **Feels bad** (code is there but a user would notice):
+  - PTY is spawned at 80×24 before the browser reports actual cols/rows. Banner-heavy shells flash briefly until the `resize` envelope lands; rescued in practice by the resize-driven prompt re-emit.
+  - WS reconnect after a transient network blip kills the only pane; the user has to refresh the browser tab to recover.
+
+## 11. Decision recording
+
+For non-obvious decisions, set a precedent, or could surprise the user on review, record a one-liner:
+
+> **Decision:** [one-sentence description]. **Tier:** T0/T1/T2/T3. **Evidence:** [link to state-of-play bullet / file path / test result / run output]. **Trade-off:** [what is being deferred and why, if anything].
+
+Tier and evidence are required. The trade-off line is required when the chosen action is not the most obvious one. A decision that cannot point to evidence is a guess — gather the evidence first.
+
+## 12. Session-done checklist
+
+A session is done when **all** of the following are true:
+
+1. All Tier 0 and Tier 1 items from the state-of-play note are resolved, or blocked on a vision decision surfaced via the documented alert mechanism.
+2. Every open item in `INBOX.md` is addressed, declined with reason, or escalated as a vision hole.
+3. `BLOCKED.md` has been scanned and is up to date — no stale entries; every open entry still has a current "Tried / Needed / Impact" note.
+4. All in-flight work is committed.
+5. Build, tests, and smoke checks all pass.
+6. State-of-play note is updated and the 10-entry cap is enforced.
+7. The next session has a clear, evidenced starting point.
+
+A session that adds new Tier 2/3 work while Tier 0/1 is open is not done.
+
+## 13. Examples of good and bad decisions
+
+**Good (recorded inline):**
+
+> **Decision:** Vendor xterm.js + fit addon inside the binary per vision principle #1 (one self-contained deliverable). **Tier:** T0. **Evidence:** `VISION.md` §5 ("No telemetry, offline-after-first-load") + `Cargo.toml` `rust-embed` dependency. **Trade-off:** larger binary; deferred CDN for later.
+
+**Bad (do not):**
+
+> Add file-explorer UI as Tier 2 even though the terminal pane crashes intermittently — skipping Tier 0 because the new feature felt more "productive."
+
+## 14. Doc model and size discipline
+
+This file must stay under ~400 lines. Detailed conventions live under `docs/`, per-module specs under `specs/<module>/`, and recurring workflow instructions under `skills/` or another repository-owned support file when the host agent supports them. This file is the index; rest of the repo holds the detail.
+
+Signs the doc model needs restructuring, not more content:
+
+- A single section here is over ~100 lines.
+- The same rule is repeated in three places.
+- A workflow described here would be clearer as an invokable skill.
+- A spec has outgrown its folder and is hiding a chunk of `AGENTS.md` as inline policy.

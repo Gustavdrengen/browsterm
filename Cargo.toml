@@ -1,0 +1,46 @@
+[package]
+name = "browsterm"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+description = "Browsterm — a first-class graphical terminal for any Linux machine, in your browser."
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/browsterm"
+
+[[bin]]
+name = "browsterm"
+path = "src/main.rs"
+
+[build-dependencies]
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "fs", "signal", "io-util", "process"] }
+axum = { version = "0.8", features = ["ws", "http2"] }
+tower = { version = "0.5", features = ["util"] }
+
+portable-pty = "0.8"
+
+rust-embed = "8"
+mime_guess = "2"
+
+open = "5"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+anyhow = "1"
+thiserror = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+futures-util = "0.3"
+bytes = "1"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"

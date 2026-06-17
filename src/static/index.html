@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Browsterm</title>
+    <link rel="stylesheet" href="app.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css"
+      crossorigin="anonymous"
+    />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">Browsterm</div>
+      <nav class="tabs" aria-label="Tabs">
+        <button class="tab is-active" type="button" data-pane="t1">Terminal 1</button>
+      </nav>
+      <div class="status" id="status">…</div>
+    </header>
+
+    <main class="workspace">
+      <section class="pane is-active" id="t1">
+        <div class="terminal-host" id="term"></div>
+      </section>
+    </main>
+
+    <footer class="statusbar">
+      <span id="conn">connecting…</span>
+      <span class="spacer"></span>
+      <span id="dims">–</span>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    <script src="app.js"></script>
+    <!-- TODO(agent, Tier 3 hardening): add sha384 SRI integrity attributes
+         to the two CDN script tags and the CSS link above. Compute once,
+         commit, and verify the hashes still match the chosen xterm /
+         xterm-addon-fit versions on every release. -->
+  </body>
+</html>
