@@ -131,6 +131,32 @@ The agent appends a dated entry here after every state-of-play gate. The section
 
 <!-- State-of-play entries inserted below. -->
 
+#### - [2026-06-17] Tier-2 file-explorer preview pane
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` (no warnings) + `cargo test --release` (20/20 pass, +5 in `fs::tests`): `file_endpoint_emits_expected_content_type_for_known_extensions` (Content-Type sweep for .png / .jpeg / .svg / .mp3 / .mp4 / .pdf / .html / .json / .xml / .toml / .txt), `file_endpoint_body_matches_input_bytes` axum round-trip, `symlink_to_dir_is_flagged_target_is_dir`, `broken_symlink_target_flags_are_none`, `symlink_to_special_file_target_flags_are_both_false`, plus the existing `symlinks_are_listed_with_target_not_followed` extended with `target_is_dir` / `target_is_file` assertions.
+  - Click a file row → `/api/fs/file?path=...`; render by MIME: `<img>` for image/* (incl. svg), `<audio controls>` for audio/*, `<video controls>` for video/*, `<iframe>` (browser-native) for application/pdf, `<iframe sandbox="">` (no allow tokens) for text/html, `fetch()`+`<pre>` for text-y MIMEs (text/* + application/json|xml|yaml|x-yaml|toml|javascript|ld+json|x-shellscript|sql|x-ndjson), a centred `<a download>` button for everything else.
+  - Symlink rows are first-class: `target_is_dir=true` → navigate; `target_is_file=true` → openFile; `target_is_{dir,file}=false` → "special file (device, pipe, or socket)\u2014not previewable" inert; both undefined → "broken symlink\u2014target is missing or unreadable" inert. Every row's visual state is honest in every case. Mirrors the same `is-disabled` styling CSS ships for files, so the gray-and-cursor-default affordance is uniform.
+  - Esc closes the preview; the \u00d7 button does too. After open/close, `requestAnimationFrame(window.__browsterm_refit)` keeps xterm's cell grid matched to its new flex width, so the terminal never renders stretched or squashed.
+  - `.workspace.previewing .pane.is-active { flex: 1 1 50% }` gives a clean 50/50 split; the sidebar still owns 240px; the terminal is never hidden beneath the preview \u2014 VISION principle #2 (the terminal is sacred) survives. `.preview-pane` is `display: none` until `.is-active`, so the workspace has zero latent cost when no preview is open.
+  - Smoke on a fresh fixture tree (run via `./target/release/browsterm --no-browser --port 8771` with a symlinked dir, symlinked file, broken symlink, and a `/dev/null` link): `/api/fs/list` exposes `target_is_dir` / `target_is_file` so the JS routes correctly for every kind; `/api/fs/file` returns the right Content-Type for the full sweep, plus structured 404 for a missing path.
+
+- **Broken / rough / missing** (user-visible):
+  - **Syntax highlighting deferred to Tier 3.** VISION §2 calls for "text as syntax-highlighted code"; MVP ships `<pre>` monospace only.
+  - **CSV-as-sortable-table deferred to Tier 3.** CSV files render as text. Tier 3 lands the parser + a real `<table>` with column sort.
+  - **Hex fallback deferred to Tier 3.** Unknown binaries get a centred "Download" button rather than a hex viewer.
+  - **No preview-pane keyboard navigation.** Tier 3 to wire arrow keys between siblings, Tab to close, Home/End to top/bottom.
+  - **No JS unit tests** in this repo (no Vitest / Jest / Playwright harness). Sidebar + preview logic are exercised manually via smoke; Tier 3 to add a harness.
+  - **No Range / chunked fetch** on `/api/fs/file`; oversized files return 400 wholesale. Tier 3 follow-up, paired with the missing `--fs-max-bytes` CLI flag.
+  - **`<video preload="metadata">`** fires an immediate GET when an element is mounted. Acceptable for MVP; Tier 3 to make it lazy / onClick.
+  - **Browsing to a directory leaves the preview open with stale contents** \u2014 intentional for now (lets a user keep a file open while navigating siblings), Tier 3 to decide whether clicking a directory should auto-close.
+
+- **Feels bad** (code is there but a user would notice):
+  - **`<iframe>` for PDFs works in Chromium and Firefox without backend help**, but a user agent without a built-in PDF viewer auto-downloads. The download button in `app.js` is the explicit escape hatch; the function-level doc on `fs::file` documents the contract so the next author doesn't think the iframe path is broken.
+  - **`<video>` and `<audio>` elements fetch the entire body before the user presses play.** Acceptable when browsing a tree of curated files; the moment a user opens a 500 MiB binary once, they'll discover this. Logged here so the Tier 3 polish picks it up alongside hex and Range.
+
+> **Decision:** Ship the preview pane as a sibling flex pane, with browser-native render routing by MIME; defer syntax highlighting, CSV tables, and hex fallback to Tier 3. **Tier:** T2. **Evidence:** 20 Rust unit tests + smoke run reproducing Content-Type, symlink-kind probing, and broken-link handling. **Trade-off:** text previews are plain monospace until highlight.js is vendored in a Tier-3 commit; that adds material binary weight (~150\u202fKB minified + an explicit language-table dependency) and warrants its own commit boundary.
+
 #### - [2026-06-17] Tier-2 file-explorer sidebar UI
 
 - **Works** (verifiable as a user would experience it):

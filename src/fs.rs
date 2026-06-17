@@ -51,6 +51,14 @@ pub struct FsEntry {
     pub is_dir: bool,
     pub is_file: bool,
     pub is_symlink: bool,
+    /// For symlinks (and only symlinks) this flags what the *target* is.
+    /// Drives the sidebar's click affordance: a symlinked dir is navigated
+    /// into, a symlinked file is opened in the preview pane. `None` when
+    /// the target could not be resolved (broken link, permission denied).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_is_dir: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_is_file: Option<bool>,
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtime_secs: Option<u64>,
@@ -144,6 +152,14 @@ pub async fn list(Query(req): Query<FsRequest>) -> Result<Json<ListResponse>, Fs
 /// listing endpoint takes the opposite route (exposes `is_symlink: true`
 /// and never resolves target bytes); the two endpoints are intentionally
 /// asymmetric, with the directory listing faithful to the on-disk graph.
+///
+/// PDF behaviour: the response carries `Content-Type: application/pdf`
+/// without a `Content-Disposition` header. Browsers with a built-in PDF
+/// viewer (Chromium, Firefox) render the bytes inside `<iframe>`; users
+/// whose browser falls back to download-mode for PDFs get the bytes saved
+/// directly, which is also the right outcome for a foreign MIME they
+/// can't preview. The download button in `app.js` is the explicit
+/// escape hatch for that case.
 pub async fn file(Query(req): Query<FsRequest>) -> Result<Response, FsError> {
     let raw = sanitize_path(&req.path)?;
     let canonical = tokio::task::spawn_blocking(move || std::fs::canonicalize(&raw))
@@ -217,11 +233,30 @@ fn read_and_sort(dir: PathBuf) -> Result<Vec<FsEntry>, FsError> {
         } else {
             None
         };
+        // For symlinks, follow exactly one level so the sidebar can route
+        // clicks (a linked dir → navigate, a linked file → preview). The
+        // non-`symlink_`-prefixed `std::fs::metadata` resolves through one
+        // hop and returns the *target*'s file type, which is what we need.
+        // A missing or unreadable target leaves the fields None; the UI
+        // treats that as a broken link and shows an inline error.
+        let (target_is_dir, target_is_file) = if is_symlink {
+            match std::fs::metadata(entry.path()) {
+                Ok(m) => {
+                    let t = m.file_type();
+                    (Some(t.is_dir()), Some(t.is_file()))
+                }
+                Err(_) => (None, None),
+            }
+        } else {
+            (None, None)
+        };
         entries.push(FsEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             is_dir,
             is_file,
             is_symlink,
+            target_is_dir,
+            target_is_file,
             size,
             mtime_secs,
             mime,
@@ -317,11 +352,64 @@ mod tests {
         assert!(!link.is_file);
         assert!(link.symlink_target.is_some());
         assert!(link.symlink_target.as_deref().unwrap().ends_with("real"));
+        // The target resolves to a regular file — `target_is_file` is true.
+        assert_eq!(link.target_is_file, Some(true));
+        assert_eq!(link.target_is_dir, Some(false));
 
         let real_entry = entries.iter().find(|e| e.name == "real").unwrap();
         assert!(!real_entry.is_symlink);
         assert!(real_entry.is_file);
         assert!(real_entry.symlink_target.is_none());
+        // Non-symlink entries never carry target-kind flags.
+        assert_eq!(real_entry.target_is_dir, None);
+        assert_eq!(real_entry.target_is_file, None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_to_dir_is_flagged_target_is_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target_dir = dir.path().join("real_dir");
+        std::fs::create_dir(&target_dir).unwrap();
+        std::os::unix::fs::symlink(&target_dir, dir.path().join("into")).unwrap();
+
+        let entries = read_and_sort(dir.path().to_path_buf()).unwrap();
+        let link = entries.iter().find(|e| e.name == "into").unwrap();
+        assert!(link.is_symlink);
+        assert_eq!(link.target_is_dir, Some(true));
+        assert_eq!(link.target_is_file, Some(false));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn broken_symlink_target_flags_are_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink("/no/such/target", dir.path().join("dangling")).unwrap();
+
+        let entries = read_and_sort(dir.path().to_path_buf()).unwrap();
+        let link = entries.iter().find(|e| e.name == "dangling").unwrap();
+        assert!(link.is_symlink);
+        assert!(link.symlink_target.is_some());
+        // The target could not be resolved — both flags stay None so the
+        // UI shows a "broken symlink" affordance instead of crashing.
+        assert_eq!(link.target_is_dir, None);
+        assert_eq!(link.target_is_file, None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_to_special_file_target_flags_are_both_false() {
+        // /dev/null is the canonical "neither-dir-nor-file" target. The
+        // UI must distinguish this case from a broken symlink so the
+        // affordance can read "special device, not previewable".
+        let dir = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink("/dev/null", dir.path().join("null_link")).unwrap();
+
+        let entries = read_and_sort(dir.path().to_path_buf()).unwrap();
+        let link = entries.iter().find(|e| e.name == "null_link").unwrap();
+        assert!(link.is_symlink);
+        assert_eq!(link.target_is_dir, Some(false));
+        assert_eq!(link.target_is_file, Some(false));
     }
 
     #[test]
@@ -403,5 +491,82 @@ mod tests {
         let Json(body) = outcome.expect("empty-path list should succeed");
         let names: Vec<&str> = body.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["Folder", ".hidden", "A_file.txt", "z_file.txt"]);
+    }
+
+    /// The file endpoint is the load-bearing seam for the browser-side
+    /// preview pane (`src/static/app.js`). For every file kind the
+    /// preview pane routes by `Content-Type`, the backend must send
+    /// back exactly the MIME the browser's element picker expects:
+    /// images/audio/video/PDF/SVG for native tags; text-ish for the
+    /// `<pre>` fallback; octet-stream for everything else. mime_guess
+    /// occasionally appends `; charset=...` on text/* kinds, so the
+    /// test compares on the type/subtype prefix only.
+    ///
+    /// The expected values are taken from `mime_guess`'s public mapping
+    /// for each extension — that crate, not this code, is the source of
+    /// truth. If a future mime_guess release changes one of the entries
+    /// below, update the test (and the JS routing in `app.js` if the
+    /// change crosses a text/binary boundary, e.g. `text/xml` versus
+    /// `application/xml`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_endpoint_emits_expected_content_type_for_known_extensions() {
+        use axum::extract::Query;
+        let dir = tempfile::TempDir::new().unwrap();
+        let cases: &[(&str, &[u8], &str)] = &[
+            ("pixel.png", b"\x89PNG\r\n", "image/png"),
+            ("photo.jpeg", b"\xff\xd8\xff", "image/jpeg"),
+            ("logo.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>", "image/svg+xml"),
+            ("song.mp3", b"ID3\x03", "audio/mpeg"),
+            ("clip.mp4", b"\0\0\0 ftyp", "video/mp4"),
+            ("sheet.pdf", b"%PDF-fake", "application/pdf"),
+            ("page.html", b"<html></html>", "text/html"),
+            ("data.json", b"{}", "application/json"),
+            ("feed.xml", b"<x/>", "text/xml"),
+            ("Cargo.toml", b"[pkg]\nname=\"x\"\n", "text/x-toml"),
+            ("doc.txt", b"hi", "text/plain"),
+        ];
+        for (name, body, expected) in cases {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            let res = file(Query(FsRequest {
+                path: p.to_string_lossy().into_owned(),
+            }))
+            .await
+            .expect("file endpoint should succeed");
+            let ct = res
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap_or("").to_string())
+                .unwrap_or_default();
+            let primary = ct.split(';').next().unwrap_or("").trim();
+            assert_eq!(
+                primary, *expected,
+                "wrong Content-Type for {name}: full header was {ct:?}"
+            );
+        }
+    }
+
+    /// Round-trip: a file below the cap returns the bytes verbatim even
+    /// when the binary preview branch (image/audio/etc.) is the consumer.
+    /// The preview pane never decodes bytes from the listing endpoint,
+    /// so the response body is what `<img src=>`/`<audio src=>` actually
+    /// reads. Confirms the body is the same bytes we wrote.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_endpoint_body_matches_input_bytes() {
+        use axum::extract::Query;
+        use axum::body::to_bytes;
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("payload.bin");
+        let original: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        std::fs::write(&p, &original).unwrap();
+        let res = file(Query(FsRequest {
+            path: p.to_string_lossy().into_owned(),
+        }))
+        .await
+        .expect("file endpoint should succeed");
+        let body = to_bytes(res.into_body(), 4096)
+            .await
+            .expect("body must collect under the cap");
+        assert_eq!(body.as_ref(), original.as_slice());
     }
 }

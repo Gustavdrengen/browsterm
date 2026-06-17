@@ -162,6 +162,17 @@
     }
   });
 
+  // Expose a manual refit so other parts of the workspace (the file
+  // preview pane) can ask the terminal to re-measure its host box after
+  // a layout change that does not go through `window.resize` (i.e. when
+  // a sibling flex child appears or disappears).
+  window.__browsterm_refit = () => {
+    if (!fitAddon) return;
+    fitAddon.fit();
+    const { cols, rows } = reportDims();
+    sendEnvelope({ type: "resize", cols, rows });
+  };
+
   // Stop reconnecting once the page is going away; otherwise a closed tab
   // would keep its reconnect timer alive in the background.
   window.addEventListener("pagehide", () => {
@@ -319,11 +330,40 @@
       if (entry.is_dir) {
         row.addEventListener("click", () => navigate(joinRelative(sidebar.currentPath, entry.name)));
       } else if (entry.is_file) {
-        // Preview pane ships in Commit D. Until then the row is visibly
-        // disabled so the affordance is clear without a tooltip pop-up.
-        row.classList.add("is-disabled");
-        row.disabled = true;
-        row.title = "Preview pane ships in Commit D";
+        const rowPath = joinRelative(sidebar.currentPath, entry.name);
+        const rowName = entry.name;
+        const rowMime = entry.mime || "";
+        row.addEventListener("click", () => openFile(rowPath, rowName, rowMime));
+      } else if (entry.is_symlink) {
+        // Symlinks often act like their target, so we route by target kind
+        // (set in fs.rs through one level of follow via std::fs::metadata).
+        // The server canonicalises on every request, so the symlink path
+        // is forwarded verbatim — the user sees the target's bytes / its
+        // listing without having to chase the link manually.
+        const rowPath = joinRelative(sidebar.currentPath, entry.name);
+        const rowName = entry.name;
+        const rowMime = entry.mime || "";
+        if (entry.target_is_dir === true) {
+          row.addEventListener("click", () => navigate(rowPath));
+        } else if (entry.target_is_file === true) {
+          row.addEventListener("click", () => openFile(rowPath, rowName, rowMime));
+        } else if (
+          entry.target_is_dir === false ||
+          entry.target_is_file === false
+        ) {
+          // Resolved but neither dir nor file: a device, pipe, or socket.
+          // The row stays visually inert so the affordance stays honest.
+          row.classList.add("is-disabled");
+          row.disabled = true;
+          row.title =
+            "special file (device, pipe, or socket) \u2014 not previewable";
+        } else {
+          // Broken symlink: target missing or unreadable. The row stays
+          // visually inert so the affordance stays honest.
+          row.classList.add("is-disabled");
+          row.disabled = true;
+          row.title = "broken symlink \u2014 target is missing or unreadable";
+        }
       }
       entriesEl.appendChild(row);
     }
@@ -351,4 +391,219 @@
 
   // Expose for debugging only; not part of the contract.
   window.__browsterm_sidebar = sidebar;
+
+  // --- Preview pane ---------------------------------------------------------
+  // Click a file row to populate the preview pane. Browser-native rendering
+  // for anything the browser already knows how to display (images, audio,
+  // video, PDF, HTML in a sandboxed iframe); fetch+pre for text-y MIME;
+  // a centred download button otherwise. Esc or the × button returns the
+  // workspace to single-pane mode. The helpers below no-op when the
+  // preview markup is missing so the sidebar IIFE stays portable.
+  const workspaceEl = document.querySelector(".workspace");
+  const previewEl = document.getElementById("preview");
+  const previewNameEl = document.getElementById("preview-name");
+  const previewMimeEl = document.getElementById("preview-mime");
+  const previewBodyEl = document.getElementById("preview-body");
+  const previewCloseEl = document.getElementById("preview-close");
+  const previewReady =
+    !!workspaceEl &&
+    !!previewEl &&
+    !!previewNameEl &&
+    !!previewMimeEl &&
+    !!previewBodyEl;
+
+  function previewEmpty() {
+    previewBodyEl.textContent = "";
+    const empty = document.createElement("div");
+    empty.className = "preview-empty";
+    empty.textContent = "Select a file to preview.";
+    previewBodyEl.appendChild(empty);
+  }
+
+  function previewError(status, message) {
+    previewBodyEl.textContent = "";
+    const err = document.createElement("div");
+    err.className = "preview-error";
+    err.textContent = status + " \u2014 " + message;
+    previewBodyEl.appendChild(err);
+  }
+
+  function fileUrl(target) {
+    return "/api/fs/file?path=" + encodeURIComponent(target);
+  }
+
+  function isTextyMime(mime) {
+    const m = (mime || "").toLowerCase();
+    if (m.startsWith("text/")) return true;
+    return (
+      m === "application/json" ||
+      m === "application/xml" ||
+      m === "application/ld+json" ||
+      m === "application/yaml" ||
+      m === "application/x-yaml" ||
+      m === "application/toml" ||
+      m === "application/javascript" ||
+      m === "application/x-shellscript" ||
+      m === "application/sql" ||
+      m === "application/x-ndjson"
+    );
+  }
+
+  function previewRender(target, name, mime) {
+    const m = (mime || "").toLowerCase();
+    if (m.startsWith("image/")) {
+      previewBodyEl.textContent = "";
+      const wrap = document.createElement("div");
+      wrap.className = "preview-img";
+      const img = document.createElement("img");
+      img.alt = name;
+      img.src = fileUrl(target);
+      wrap.appendChild(img);
+      previewBodyEl.appendChild(wrap);
+      return;
+    }
+    if (m.startsWith("audio/")) {
+      previewBodyEl.textContent = "";
+      const wrap = document.createElement("div");
+      wrap.className = "preview-audio";
+      const audio = document.createElement("audio");
+      audio.controls = true;
+      audio.preload = "metadata";
+      audio.src = fileUrl(target);
+      wrap.appendChild(audio);
+      previewBodyEl.appendChild(wrap);
+      return;
+    }
+    if (m.startsWith("video/")) {
+      previewBodyEl.textContent = "";
+      const wrap = document.createElement("div");
+      wrap.className = "preview-video";
+      const video = document.createElement("video");
+      video.controls = true;
+      video.preload = "metadata";
+      video.src = fileUrl(target);
+      wrap.appendChild(video);
+      previewBodyEl.appendChild(wrap);
+      return;
+    }
+    if (m === "application/pdf" || m.startsWith("application/pdf")) {
+      // Browser-native PDF rendering via <iframe>. Works in Chromium and
+      // Firefox without backend help. Falls back to download if the user's
+      // browser lacks a built-in PDF viewer; they get the bytes anyway.
+      // `startsWith` is defensive: MIME parameters (e.g. `application/pdf;
+      // charset=binary`) shouldn't, but a future mime_guess or vendor
+      // prefix shouldn't strand us either.
+      previewBodyEl.textContent = "";
+      const iframe = document.createElement("iframe");
+      iframe.className = "preview-iframe";
+      iframe.title = "PDF: " + name;
+      iframe.src = fileUrl(target);
+      previewBodyEl.appendChild(iframe);
+      return;
+    }
+    if (m === "text/html" || m.startsWith("text/html")) {
+      // sandbox="" with no allow-tokens guarantees a hostile local HTML
+      // file cannot run scripts or postMessage back to the parent.
+      previewBodyEl.textContent = "";
+      const iframe = document.createElement("iframe");
+      iframe.className = "preview-iframe";
+      iframe.title = "HTML: " + name;
+      iframe.sandbox = "";
+      iframe.src = fileUrl(target);
+      previewBodyEl.appendChild(iframe);
+      return;
+    }
+    if (isTextyMime(mime)) {
+      // Fetch the bytes as text and render them in <pre>. Errors fall
+      // through to the same unified error view as everywhere else.
+      previewBodyEl.textContent = "";
+      const loading = document.createElement("div");
+      loading.className = "preview-empty";
+      loading.textContent = "loading\u2026";
+      previewBodyEl.appendChild(loading);
+      fetch(fileUrl(target), { headers: { Accept: "text/plain,*/*" } })
+        .then((res) => {
+          if (!res.ok) {
+            return res
+              .json()
+              .then((body) =>
+                previewError(
+                  res.status,
+                  (body && body.error && body.error.message) || res.statusText
+                )
+              )
+              .catch(() => previewError(res.status, res.statusText));
+          }
+          return res.text();
+        })
+        .then((text) => {
+          if (typeof text !== "string") return; // already rendered an error
+          previewBodyEl.textContent = "";
+          const pre = document.createElement("pre");
+          pre.className = "preview-pre";
+          pre.textContent = text;
+          previewBodyEl.appendChild(pre);
+        })
+        .catch((err) =>
+          previewError("network", (err && err.message) || String(err))
+        );
+      return;
+    }
+    // Catch-all: a centred Download button. The browser fetches the URL,
+    // saves the bytes, and the response carries the right Content-Type.
+    previewBodyEl.textContent = "";
+    const a = document.createElement("a");
+    a.className = "preview-download";
+    a.href = fileUrl(target);
+    a.download = name;
+    a.textContent = "\u2193 Download " + name;
+    previewBodyEl.appendChild(a);
+  }
+
+  function refitTerminal() {
+    // Defer the terminal refit until the new flex layout has actually
+    // settled. xterm.js measures the terminal-host box at fit() time, so
+    // calling it before the browser has repainted would re-fit against
+    // the stale width and not pick up the preview's share of the row.
+    if (typeof window.__browsterm_refit === "function") {
+      window.__browsterm_refit();
+    }
+  }
+
+  function openFile(target, name, mime) {
+    if (!target || !previewReady) return;
+    previewEl.hidden = false;
+    previewEl.classList.add("is-active");
+    workspaceEl.classList.add("previewing");
+    previewNameEl.textContent = name;
+    previewMimeEl.textContent = mime || "";
+    previewRender(target, name, mime);
+    requestAnimationFrame(refitTerminal);
+  }
+
+  function closePreview() {
+    if (!previewReady || !previewEl.classList.contains("is-active")) return;
+    previewEl.classList.remove("is-active");
+    previewEl.hidden = true;
+    workspaceEl.classList.remove("previewing");
+    previewNameEl.textContent = "Preview";
+    previewMimeEl.textContent = "";
+    previewEmpty();
+    requestAnimationFrame(refitTerminal);
+  }
+
+  if (previewCloseEl) previewCloseEl.addEventListener("click", closePreview);
+
+  // Esc closes the preview regardless of which pane currently has focus.
+  // The check on `is-active` keeps the listener a no-op when the preview
+  // is closed, so the keystroke is free to reach the terminal/xterm.
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (!previewReady) return;
+    if (!previewEl.classList.contains("is-active")) return;
+    e.preventDefault();
+    closePreview();
+  });
+
+  if (previewReady) previewEmpty();
 })();

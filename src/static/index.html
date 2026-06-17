@@ -29,6 +29,23 @@
         <nav id="breadcrumbs" class="breadcrumbs" aria-label="Path"></nav>
         <div id="entries" class="entries" role="list"></div>
       </aside>
+      <section class="preview-pane" id="preview" aria-label="Preview" hidden>
+        <header class="preview-header">
+          <span class="preview-name" id="preview-name">Preview</span>
+          <span class="preview-mime" id="preview-mime"></span>
+          <span class="spacer"></span>
+          <button
+            type="button"
+            class="preview-close"
+            id="preview-close"
+            title="Close preview (Esc)"
+            aria-label="Close preview"
+          >✕</button>
+        </header>
+        <div class="preview-body" id="preview-body">
+          <div class="preview-empty">Select a file to preview.</div>
+        </div>
+      </section>
       <section class="pane is-active" id="t1">
         <div class="terminal-host" id="term"></div>
       </section>
