@@ -131,6 +131,24 @@ The agent appends a dated entry here after every state-of-play gate. The section
 
 <!-- State-of-play entries inserted below. -->
 
+#### - [2026-06-21] Tier-3 sidebar keyboard navigation
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` (no warnings) + `cargo test --release` (22/22 pass; no Rust surface change since the work is browser-side).
+  - The sidebar's entry list responds to Up/Down/Home/End/Enter/Backspace with the system-picker convention. Disabled rows (broken symlinks, special files via `/dev/null` etc.) are excluded from the navigable set so the keyboard cannot activate the visually-inert affordance. A fresh directory listing resets `sidebarRowIndex = -1` on every render so a stale highlight never carries over.
+  - Enter reuses the row's `click()` path so the existing router (navigate vs openFile) remains the single source of truth — no second-handler duplication. Backspace strips one trailing `/`-segment from `sidebar.currentPath` and re-navigates; from `/` it no-ops so a user holding Backspace doesn't endlessly try to chdir into a non-existent parent.
+  - Visual: `.fs-row.is-active` gets an accent-tinted background + outline; `.fs-row:focus-visible` adds a separate focus ring so kbd-only / screen-reader users see a highlight whether or not the row is the *active* one.
+
+- **Broken / rough / missing** (user-visible):
+  - No auto-focus the entries container on every navigate. Auto-focus would steal focus away from the terminal pane mid-keystroke, so the user still has to click into the sidebar first before arrows work.
+  - No `Ctrl+.` global hotkey to flip dotfile visibility from outside the sidebar. Tab+Space inside the checkbox works.
+  - No roving-tab-index optimisation for the entries list — every row gets `tabindex="0"` (via the underlying `<button>`). For a directory with thousands of entries this could become noisy for screen readers; Tier 3 follow-up.
+
+- **Feels bad** (code is there but a user would notice):
+  - The `Backspace`-to-step-up keybinding differs from the platform norm on macOS (where some apps bind it to forward-history). Cross-platform keyboard conventions are an impossible nirvana; matching *Finder/VS Code's Explorer* over *macOS Safari* is the documented picker bet.
+
+> **Decision:** Mirror Finder / VS Code Explorer / Windows Explorer (Up/Down step, Enter activate, Backspace step out, Home/End snap to ends) instead of inventing a new sidebar keymap. **Tier:** T3. **Evidence:** 22 Rust tests still pass; embedded `/app.js` contains the row-step handlers; embedded `/app.css` contains the new `.fs-row.is-active` / `.fs-row:focus-visible` rules. **Trade-off:** auto-focus on every navigate would have given a kbd-only user immediate arrow control inside any new folder — opted against so the terminal pane focus is never silently stolen from a typing user.
+
 #### - [2026-06-21] Tier-2 sidebar hidden-file toggle
 
 - **Works** (verifiable as a user would experience it):
