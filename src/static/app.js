@@ -319,6 +319,10 @@
 
   function renderEntries(entries) {
     entriesEl.textContent = "";
+    // Reset keyboard-nav selection on every render so a brand-new
+    // directory never inherits the highlight from the previous one.
+    // The first ArrowUp/ArrowDown keystroke lands on row 0.
+    sidebarRowIndex = -1;
     if (!entries || entries.length === 0) {
       const empty = document.createElement("div");
       empty.className = "fs-empty";
@@ -399,6 +403,80 @@
       refresh();
     });
   }
+
+  // --- Sidebar keyboard navigation ----------------------------------------
+  // Up/Down/Enter/Backspace/Home/End mirror the row-step convention
+  // every system file picker uses (Finder, VS Code's explorer, Windows
+  // Explorer's tree). Disabled rows (broken symlinks, special files)
+  // are filtered out of the navigation set so the user cannot activate
+  // them — the `.fs-row.is-disabled` style already keeps them visually
+  // inert and the tooltip is the same hint whatever the input device.
+  let sidebarRowIndex = -1;
+
+  function getNavigableRows() {
+    // Live querySelector on every keypress is fine: this list is at most
+    // thousands of nodes, the call only walks the entries container,
+    // and the browser caches the tree for one frame.
+    return Array.from(entriesEl.querySelectorAll(".fs-row:not(.is-disabled)"));
+  }
+
+  function setSidebarRowIndex(next, rows) {
+    if (rows.length === 0) {
+      sidebarRowIndex = -1;
+      return;
+    }
+    sidebarRowIndex = Math.max(0, Math.min(rows.length - 1, next));
+    for (let i = 0; i < rows.length; i++) {
+      rows[i].classList.toggle("is-active", i === sidebarRowIndex);
+    }
+    // Pull focus onto the row so screen readers and the next keystroke
+    // both land on the highlighted entry.
+    rows[sidebarRowIndex].focus();
+    // Scroll into view if needed so a long listing doesn't strand the
+    // selected row under the breadcrumb bar.
+    rows[sidebarRowIndex].scrollIntoView({ block: "nearest" });
+  }
+
+  entriesEl.addEventListener("keydown", (e) => {
+    const rows = getNavigableRows();
+    if (rows.length === 0) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setSidebarRowIndex(sidebarRowIndex < 0 ? 0 : sidebarRowIndex + 1, rows);
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setSidebarRowIndex(sidebarRowIndex < 0 ? rows.length - 1 : sidebarRowIndex - 1, rows);
+      return;
+    }
+    if (e.key === "Home") {
+      e.preventDefault();
+      setSidebarRowIndex(0, rows);
+      return;
+    }
+    if (e.key === "End") {
+      e.preventDefault();
+      setSidebarRowIndex(rows.length - 1, rows);
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const row = rows[sidebarRowIndex];
+      if (row) row.click();
+      return;
+    }
+    if (e.key === "Backspace") {
+      e.preventDefault();
+      // Step the sidebar one level up. From `/` we no-op so a user
+      // holding Backspace doesn't endlessly try to chdir into a non-
+      // existent parent.
+      if (!sidebar.currentPath || sidebar.currentPath === "/") return;
+      const parent = sidebar.currentPath.replace(/\/[^/]*$/, "") || "/";
+      navigate(parent);
+      return;
+    }
+  });
 
   // Poll. Pause when the tab is hidden so a backgrounded workspace does
   // not hammer the FS every five seconds. Stop entirely on pagehide so
