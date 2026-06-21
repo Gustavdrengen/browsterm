@@ -227,6 +227,17 @@
     return parent.replace(/\/+$/, "") + "/" + child;
   }
 
+  // Single source of truth for "this row opens a previewable file".
+  // Used by the sidebar click router in `renderEntries` *and* by the
+  // preview-pane keyboard cycler so the two can never disagree about
+  // which siblings are skippable. Adding a new file kind (e.g. CSV-as-
+  // sortable-table in Tier 3) only needs to update this one predicate.
+  function isOpenableRow(entry) {
+    if (!entry) return false;
+    if (entry.is_file) return true;
+    return entry.is_symlink === true && entry.target_is_file === true;
+  }
+
   async function navigate(target) {
     if (!target) return;
     const ticket = ++sidebar.inFlight;
@@ -259,6 +270,11 @@
       const data = await res.json();
       if (ticket !== sidebar.inFlight) return;
       sidebar.currentPath = data.path;
+      // Cache the listing so the preview-pane sibling cycler can step
+      // through sibling files without a round-trip back to the server.
+      // Survives navigate() so a single ArrowDown keystroke during a
+      // preview never triggers a refetch before it resolves.
+      sidebar.lastEntries = data.entries;
       renderBreadcrumbs();
       renderEntries(data.entries);
       // Surface the active filter inline so the count never reads as
@@ -352,7 +368,7 @@
 
       if (entry.is_dir) {
         row.addEventListener("click", () => navigate(joinRelative(sidebar.currentPath, entry.name)));
-      } else if (entry.is_file) {
+      } else if (isOpenableRow(entry)) {
         const rowPath = joinRelative(sidebar.currentPath, entry.name);
         const rowName = entry.name;
         const rowMime = entry.mime || "";
@@ -362,14 +378,15 @@
         // (set in fs.rs through one level of follow via std::fs::metadata).
         // The server canonicalises on every request, so the symlink path
         // is forwarded verbatim — the user sees the target's bytes / its
-        // listing without having to chase the link manually.
+        // listing without having to chase the link manually. Only symlinks
+        // that resolve to directories or that are broken / special end up
+        // here now; the "resolves to a file" case is handled by the
+        // `isOpenableRow` branch above.
         const rowPath = joinRelative(sidebar.currentPath, entry.name);
         const rowName = entry.name;
         const rowMime = entry.mime || "";
         if (entry.target_is_dir === true) {
           row.addEventListener("click", () => navigate(rowPath));
-        } else if (entry.target_is_file === true) {
-          row.addEventListener("click", () => openFile(rowPath, rowName, rowMime));
         } else if (
           entry.target_is_dir === false ||
           entry.target_is_file === false
@@ -518,6 +535,11 @@
     !!previewNameEl &&
     !!previewMimeEl &&
     !!previewBodyEl;
+
+  // Tracks the *name* of the file currently shown in the preview pane
+  // so the keyboard cycler (defined further down) can locate the row
+  // inside `sidebar.lastEntries`. Reset by closePreview.
+  let currentEntryName = null;
 
   function previewEmpty() {
     previewBodyEl.textContent = "";
@@ -679,13 +701,30 @@
 
   function openFile(target, name, mime) {
     if (!target || !previewReady) return;
+    // Track the name so cycleSibling can locate the current row in
+    // the cached listing. Setting this *before* the rAF means a fast
+    // ArrowDown keystroke immediately after open resolves against
+    // the right entry.
+    currentEntryName = name;
     previewEl.hidden = false;
     previewEl.classList.add("is-active");
     workspaceEl.classList.add("previewing");
     previewNameEl.textContent = name;
     previewMimeEl.textContent = mime || "";
     previewRender(target, name, mime);
-    requestAnimationFrame(refitTerminal);
+    // Make the preview pane focusable on first open so the user can
+    // immediately keystroke-arrow between siblings without an extra
+    // click. focus({preventScroll:true}) keeps the layout-shaped
+    // refit we just kicked via rAF from being undone by a viewport
+    // jump.
+    // tabIndex is the DOM-property equivalent of setAttribute("tabindex","0")
+    // and idempotent if already set, so just assign outright instead of
+    // guarding a redundant setAttribute call.
+    previewEl.tabIndex = 0;
+    requestAnimationFrame(() => {
+      refitTerminal();
+      previewEl.focus({ preventScroll: true });
+    });
   }
 
   function closePreview() {
@@ -695,6 +734,13 @@
     workspaceEl.classList.remove("previewing");
     previewNameEl.textContent = "Preview";
     previewMimeEl.textContent = "";
+    // Drop the sibling-cycler's pointer; without this, a reopen of
+    // the same name in a different directory would pretend to step
+    // from the previous-directory selection.
+    currentEntryName = null;
+    // Blur the pane so a stray ArrowUp on a no-longer-rendered
+    // preview doesn't kick off a fetch loop against a hidden file.
+    previewEl.blur();
     previewEmpty();
     requestAnimationFrame(refitTerminal);
   }
@@ -713,4 +759,72 @@
   });
 
   if (previewReady) previewEmpty();
+
+  // --- Preview-pane keyboard navigation (Arrows / Home / End) -----------.
+  // ArrowUp/Down cycle through sibling files of the currently previewed
+  // file; Home/End scroll the preview body to top/bottom. The handler
+  // is attached to previewEl itself so the keystrokes only fire when
+  // the user has clicked into the preview pane (so they don't steal
+  // arrows from the terminal). The window-level Escape handler above
+  // stays in place so closing-the-preview from anywhere still works
+  // (matches browsers' modal-close convention).
+  function cycleSibling(direction) {
+    const last = sidebar.lastEntries;
+    if (!last || last.length === 0) return;
+    if (!currentEntryName) return;
+    const idx = last.findIndex((e) => e.name === currentEntryName);
+    if (idx < 0) return;
+    const step = direction === "ArrowDown" ? 1 : -1;
+    for (let i = idx + step; i >= 0 && i < last.length; i += step) {
+      const e = last[i];
+      // Same routing as the sidebar click handler: file-symlinks count
+      // as files when their target resolves to one. Directories, broken
+      // symlinks, and special files are skipped so a kbd-cycling user
+      // never lands on a non-previewable row.
+      if (!isOpenableRow(e)) continue;
+      const path = joinRelative(sidebar.currentPath, e.name);
+      openFile(path, e.name, e.mime || "");
+      return;
+    }
+  }
+
+  if (previewReady) {
+    previewEl.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        cycleSibling(e.key);
+        return;
+      }
+      if (e.key === "Home") {
+        e.preventDefault();
+        // Scroll both the body container and any inner scroller (the
+        // <pre> for text, the <img> for images — though <img> doesn't
+        // actually overflow). Snap to top is unconditionally 0 on both;
+        // cheap to set, no-op for non-overflowing content.
+        previewBodyEl.scrollTop = 0;
+        const inner = previewBodyEl.firstElementChild;
+        if (inner) inner.scrollTop = 0;
+        return;
+      }
+      if (e.key === "End") {
+        e.preventDefault();
+        // Snap to *visible* bottom. Setting `scrollTop = scrollHeight`
+        // pushes past the bottom edge when `scrollHeight === clientHeight`;
+        // `Math.max(0, scrollHeight - clientHeight)` puts the bottom edge
+        // on the screen whether the content fits or overflows.
+        previewBodyEl.scrollTop = Math.max(
+          0,
+          previewBodyEl.scrollHeight - previewBodyEl.clientHeight
+        );
+        const inner = previewBodyEl.firstElementChild;
+        if (inner) {
+          inner.scrollTop = Math.max(
+            0,
+            inner.scrollHeight - inner.clientHeight
+          );
+        }
+        return;
+      }
+    });
+  }
 })();
