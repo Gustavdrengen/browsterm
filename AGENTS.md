@@ -131,6 +131,24 @@ The agent appends a dated entry here after every state-of-play gate. The section
 
 <!-- State-of-play entries inserted below. -->
 
+#### - [2026-06-21] Tier-2 sidebar hidden-file toggle
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` (no warnings) + `cargo test --release` (22/22 pass, +2 in `fs::tests`): `hidden_entries_filtered_when_show_hidden_false`, `hidden_symlink_filtered_when_show_hidden_false_keeps_target_flags` (always asserts the surviving `visible_link` symlink still carries `target_is_file == Some(true)` so the openFile/navigate seam is regression-tested against any future early-skip in the per-entry loop).
+  - `GET /api/fs/list?path=...&show_hidden=...` filters POSIX dotfiles by name (`.starts_with('.')`) server-side, before the sort; `show_hidden` defaults to `true` server-side so third-party clients and existing curl invocations keep the MVP behaviour. Symlinks whose *name* starts with `.` are filtered too; the per-symlink `std::fs::metadata` seam that drives the sidebar's openFile/navigate routing still runs on the survivors.
+  - Sidebar header has a `<input type="checkbox" id="fs-show-hidden" checked>` "show hidden" toggle; flipping it persists session-locally, every `navigate(...)` appends `&show_hidden=false`, and the count text reads `"N items (hidden filtered)"` while the toggle is off so the count never reads as ambiguous against the user's shell `ls -la`.
+  - Smoke (`./target/release/browsterm --no-browser --port 8775`) on a fixture tree with `.dotfile`, `.linked` (hidden symlink), `.sub/.nested`: default request exposes all four; toggle off returns only `visible`; sub-listing of `.sub` with toggle off returns `[]`.
+
+- **Broken / rough / missing** (user-visible):
+  - No global hotkey (e.g. `Ctrl+.`) to flip the toggle from the terminal pane. Tab+Space inside the checkbox works.
+  - No `localStorage` persistence — the box resets to "show" on every reload. Vision doesn't ask for it; a Tier-3 polish could remember across reloads.
+  - The shared global `.spacer { flex: 1 }` rule from the topbar + preview-header is reused inside `.sidebar-tools` to push the new toggle + refresh to the right. A future polish commit can scope it to remove the cross-import.
+
+- **Feels bad** (code is there but a user would notice):
+  - **Double-negative naming on the wire:** `show_hidden: true` everywhere (query string, struct field, JSON, DOM id). A `hidden: false` polarity would read better; not renamed because the UI label says "show hidden" and the symmetry is worth the cognitive cost.
+
+> **Decision:** Ship the toggle as a server-side filter on the existing listing endpoint rather than a client-side post-filter. **Tier:** T2. **Evidence:** 22 Rust tests + end-to-end smoke reproducing the round-trip. **Trade-off:** one extra query-string byte on every navigate; client-side filtering would be cheaper but would round-trip dotfiles a user has explicitly opted out of seeing — a real cost on huge config dirs. POSIX dotfile predicate is the only load-bearing server addition.
+
 #### - [2026-06-17] Tier-2 file-explorer preview pane
 
 - **Works** (verifiable as a user would experience it):
