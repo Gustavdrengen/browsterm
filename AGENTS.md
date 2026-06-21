@@ -131,6 +131,32 @@ The agent appends a dated entry here after every state-of-play gate. The section
 
 <!-- State-of-play entries inserted below. -->
 
+#### - [2026-06-21] Tier-2 terminal tab system
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` (no warnings) + `cargo test --release` (28/28 pass, +9 in `terminal::tests`: `create_tab_envelope_parses`, `close_tab_envelope_parses`, `rename_envelope_parses`, `resize_with_tab_id_parses`, `input_with_tab_id_parses`, `unknown_envelope_fails_loudly`, `hello_envelope_serializes_round_trip`, `tab_event_envelope_serializes_round_trip`, `encode_tab_bytes_prepends_little_endian_id`, and the combined regression `rename_trims_whitespace_and_caps_at_64_chars`).
+  - Hardcoded `Terminal 1` is replaced by a `#workspace-panes` flex container with one `.pane.is-active` per tab and a renameable tab strip (`button.tab` per tab id, `button.tab-new` anchored at the right edge). Default label `Terminal N`; double-click → inline `<input>` for rename; Enter / blur commits, Escape reverts (server rejects empty / whitespace-only and caps labels at 64 chars). Closing a tab removes from strip; closing the *active* tab jumps to the closest surviving neighbour (left-preferring, right fallback). Empty roster shows just the `＋` button.
+  - Keyboard: Ctrl+T = new tab, Ctrl+W = close active, Ctrl+Tab / Shift+Ctrl+Tab = cycle. Keydown handler skips when focus is `INPUT` / `TEXTAREA` so rename editing isn't hijacked.
+  - WS multiplexed: single `/ws` carries kebab-case JSON envelopes (`create-tab` / `close-tab` / `rename` / `resize` / `input`) and binary PTY bytes prefixed with a u32 LE `tab_id`. Server pushes a `hello` roster envelope on every upgrade; a network drop keeps the PTYs alive in `ServerState` so a reconnect or browser refresh surfaces the same running shells.
+  - Server fan-in: per-tab forwarder tasks push framed `Message::Binary` to an unbounded mpsc; the WS handler drains it serially in a single `tokio::select!`. Axum 0.8's `SplitSink` is `!Clone`, so cloning isn't an option — fan-in is the workable alternative to a `Mutex` on the WS writer. `ensure_first_tab` holds the roster mutex across the synchronous PTY spawn so two concurrent WS upgrades on an empty roster see strict "second short-circuits, no phantom duplicate".
+  - Smoke (`./target/release/browsterm --no-browser --port 8780`): `/healthz` → `ok`; `/` returns the embedded HTML (now contains `id="tab-new"` and no `data-pane="t1"`); `/app.js` went from ~30 KB to 41 071 bytes.
+
+- **Broken / rough / missing** (user-visible):
+  - **Scrollback is lost on WS reconnect.** A fresh socket re-creates xterm.js Terminal instances; the PTY is still running and the resize-driven prompt re-emit documented in `pty.rs` rescues visible state, but the user's shell history vanishes.
+  - **No roving tab-index** in the strip; every `<button.tab>` carries the default `tabindex`. Acceptable for MVP and screen-reader noise is bounded by typical tab counts.
+  - **No roster size cap.** A hostile client could open thousands of `create-tab` envelopes before the user notices. `// TODO: cap → MAX_TABS=32` flagged in `src/server.rs` for the Tier-3 harden.
+  - **Drag-to-reorder tabs** is unimplemented; spec acknowledges "later".
+  - **Tab persistence to disk across server restart** is unimplemented — a server reboot wipes the roster and clients see one fresh default tab.
+  - **The first tab still spawns at 80×24** on the very first WS upgrade; the resize-driven prompt re-emit rescues visible state, but this Tier-3 polish item carries forward from the foundation commit.
+
+- **Feels bad** (code is there but a user would notice):
+  - **Tab strip ↔ terminal focus handoff is `requestAnimationFrame`-deferred.** A user rapid-clicking through tabs may notice a one-frame paint delay before each xterm.js session refits. Acceptable.
+  - **`window.__browsterm_refit`** is now owned by the tab manager and called by the preview IIFE on every preview open/close; this sends a single `resize` envelope on each toggle. Acceptable.
+  - **Inactive-tab xterm.js accumulates output server-side** even while its pane is `display:none`. The browser paints only on activation but memory holds the buffer for every tab. Tier-3 hardening when tab counts grow large.
+  - **First `createNewTab()` after a hello rebuild**, before the host has been measured, falls through to `tab.term.cols` (`80×24`) producing a brief banner flash before the next refit. Rescued in practice by the `fitAddon.proposeDimensions()` branch on the second-and-later calls.
+
+> **Decision:** Multiplex all tabs over a single `/ws` so the existing reconnect state machine and the one-status-cell UX stay put, and the future "open text file in neovim on a new tab" workflow lands on the same envelope set without re-shaping the wire. **Tier:** T2. **Evidence:** `specs/tabs.md` is the wire-format contract; `cargo test --release` shows 28/28 unit tests + 9 new envelope and framing regressions; smoke run reproduces `/healthz`, `/`, and `/app.js` after build. **Trade-off (handled in code):** `SplitSink` is `!Clone`, so per-tab forwarder tasks can't all share it directly; sidestepped with a fan-in `mpsc::unbounded_channel` drained serially by the WS handler. Scrollback survives the WS drop *server-side* (PTY still alive) but xterm.js rebuilds a fresh Terminal on reconnect — Tier-3 polish.
+
 #### - [2026-06-21] Tier-3 preview-pane keyboard navigation
 
 - **Works** (verifiable as a user would experience it):
