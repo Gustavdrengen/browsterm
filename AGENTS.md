@@ -131,6 +131,25 @@ The agent appends a dated entry here after every state-of-play gate. The section
 
 <!-- State-of-play entries inserted below. -->
 
+#### - [2026-06-21] Tier-3 preview-pane keyboard navigation
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` (no warnings) + `cargo test --release` (22/22 pass; browser-side change).
+  - The preview pane responds to ArrowUp/Down/Home/End when it has focus. ArrowUp/Down cycles through sibling files of the currently previewed file (using `isOpenableRow` to skip dirs / broken symlinks / special files). Home/End snaps the preview body (and the inner `<pre>` for text content) to top/bottom via `Math.max(0, scrollHeight - clientHeight)` — the snap places the bottom edge on-screen instead of pushing past it.
+  - The Escape handler is unchanged: closing the preview from any pane focus point still works (the new keys are *scoped* to `previewEl` so they don't steal arrows from the terminal).
+  - `openFile` focuses the preview pane on every open so a user can immediately keystroke between siblings without an extra click. `closePreview` blurs the pane — prevents stray ArrowUp on a hidden preview from starting fetch loops.
+  - `isOpenableRow(entry)` is now a single helper used from `renderEntries` and `cycleSibling` so the click router and the keyboard cycler can't drift if a new file kind lands (CSV-as-table preview, etc.).
+
+- **Broken / rough / missing** (user-visible):
+  - No roving-tabindex optimisation: focus is moved by `previewEl.focus()` after every open; on a fast cycler that means each keypress re-runs `openFile`'s rAF + focus. Acceptable for MVP.
+  - No Tab-to-close keybinding. Esc already closes; Tab is left alone to avoid trapping users in a focus loop.
+  - The snap-bottom clamping depends on consistent `overflow:auto`; if a future preview content type changes CSS to `overflow:hidden`, keycode press silently no-ops.
+
+- **Feels bad** (code is there but a user would notice):
+  - A user mid-typing in the terminal cannot preview-cycle via keyboard unless they explicitly click into the preview pane first. Intended (don't murder terminal keystrokes) but the affordance isn't surfaced in the UI — a future commit can surface the "click to focus for keyboard" hint in the preview header.
+
+> **Decision:** Scope the new keys (Arrows/Home/End) to `previewEl` itself rather than the global window listener, so the terminal pane keeps its keystrokes. **Tier:** T3. **Evidence:** 22 Rust tests still pass; embedded `/app.js` contains `isOpenableRow` / `cycleSibling` / `currentEntryName` / the scroll-clamp pattern; smoke run reproduces the listing routing rule on a fixture tree. **Trade-off:** keys don't fire when the terminal has focus; the alternative (global key-snatching) would have stolen arrows from vim. Two reviewer rounds; no-blocker polish (snapToBottom helper extraction, currentEntryName placement, optional tabIndex ceremony) filed in the §13 backlog.
+
 #### - [2026-06-21] Tier-3 sidebar keyboard navigation
 
 - **Works** (verifiable as a user would experience it):
