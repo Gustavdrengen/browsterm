@@ -430,6 +430,101 @@ body {
   color: #f85149;
 }
 
+/* Tab strip: a row of renameable .tab buttons (one per PTY) plus a
+   trailing ＋ button. The existing .tab.is-active rule below carries
+   over to the new tab manager verbatim. */
+.tab-new {
+  background: transparent;
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font: inherit;
+  margin-left: 6px;
+}
+
+.tab-new:hover {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  white-space: nowrap;
+}
+
+.tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-close {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  padding: 0 4px;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.tab-close:hover {
+  color: #f85149;
+  background: rgba(248, 81, 73, 0.12);
+}
+
+.tab.is-renaming {
+  background: var(--bg);
+  border-color: var(--accent);
+}
+
+.tab.is-renaming input[type="text"] {
+  background: var(--bg-2);
+  border: 1px solid var(--accent);
+  color: var(--fg);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font: inherit;
+  width: 16ch;
+}
+
+/* Workspace panes: one flex child per tab id; only `.is-active` paints.
+   Inactive terminals still receive PTY bytes server-side and into
+   xterm.js's internal buffer; they only become visible when they gain
+   `.is-active`. */
+.workspace-panes {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-panes .pane {
+  flex: 1 1 auto;
+  display: none;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace-panes .pane.is-active {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Preview pane: the new workspace-panes flex child still pairs with
+   the preview so the active terminal pane shrinks to 50 % exactly as
+   it did when there was a single `#t1` pane. */
+.workspace.previewing .workspace-panes .pane.is-active {
+  flex: 1 1 50%;
+}
+
 .spacer {
   flex: 1;
 }

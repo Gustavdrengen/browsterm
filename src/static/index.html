@@ -15,7 +15,16 @@
     <header class="topbar">
       <div class="brand">Browsterm</div>
       <nav class="tabs" aria-label="Tabs">
-        <button class="tab is-active" type="button" data-pane="t1">Terminal 1</button>
+        <!-- Terminal tab strip: the manager populates .tab elements;
+             the ＋ button stays anchored at the right edge so it is
+             always reachable regardless of how many tabs exist. -->
+        <button
+          class="tab-new"
+          type="button"
+          id="tab-new"
+          title="New tab (Ctrl+T)"
+          aria-label="New tab"
+        >＋</button>
       </nav>
       <div class="status" id="status">…</div>
     </header>
@@ -51,9 +60,10 @@
           <div class="preview-empty">Select a file to preview.</div>
         </div>
       </section>
-      <section class="pane is-active" id="t1">
-        <div class="terminal-host" id="term"></div>
-      </section>
+      <!-- workspace-panes: the manager appends one .pane per tab id;
+           the active pane carries .is-active. Each pane houses a
+           single .terminal-host that xterm.js is open()ed onto. -->
+      <section class="workspace-panes" id="workspace-panes" role="tabpanel"></section>
     </main>
 
     <footer class="statusbar">

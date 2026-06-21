@@ -1,61 +1,84 @@
 // Browsterm workspace client.
-// Wires the browser terminal (xterm.js + FitAddon) to the local WebSocket
-// exposed at /ws. PTY bytes arrive as binary frames so graphic-protocol
-// data (sixel, kitty) survives the round trip untouched.
-//
-// The WebSocket is allowed to drop in the background — when the network blips
-// or the server restarts, the client reconnects with capped exponential
-// backoff plus jitter and refits the terminal on the new socket. Each new
-// connection spawns a fresh PTY on the server; xterm.js keeps the visible
-// scrollback so the user keeps their history.
+// Test it before you change it. The IIFEs below run in order: first the
+// terminal tab manager, then the file-explorer sidebar, then the preview
+// pane. Each owns an independent slice of the DOM so they do not fight
+// over the same hooks.
 
 (function () {
   "use strict";
 
+  // Browsterm terminal tab manager.
+  // Owns the WebSocket, the tab roster (each tab = one xterm.js Terminal
+  // + one PtySession on the server), the tab strip DOM, and the
+  // workspace-panes flex container.
+  //
+  // The single multiplexed /ws connection carries JSON control envelopes
+  // (`create-tab`/`close-tab`/`rename`/`resize`/`input`/`hello`/`tab-ack`/
+  // `tab-event`) and binary PTY bytes prefixed with a 4-byte u32 LE tab
+  // id. A network blip reconnects with capped exponential backoff plus
+  // jitter; the server keeps the tab roster alive across WS drops, so a
+  // reconnect greets the new socket with `hello` listing whatever tabs
+  // were running.
   const status = document.getElementById("conn");
-  const dims = document.getElementById("dims");
-  const host = document.getElementById("term");
+  const dimsEl = document.getElementById("dims");
+  const tabStrip = document.querySelector(".tabs");
+  const panesHost = document.getElementById("workspace-panes");
+  const newTabBtn = document.getElementById("tab-new");
 
-  if (typeof window.Terminal === "undefined") {
-    setStatus("xterm.js failed to load — refresh once online", "error");
-    host.textContent = "xterm.js is required.";
+  if (
+    !tabStrip ||
+    !panesHost ||
+    !newTabBtn ||
+    typeof window.Terminal === "undefined"
+  ) {
+    if (status) {
+      status.textContent =
+        "xterm.js or tab markup missing — refresh once online";
+      status.className = "error";
+    }
     return;
   }
 
-  const term = new window.Terminal({
+  // Drop any leftover hardcoded tab children from older markup. The
+  // strip is now tab-manager owned; the ＋ button is anchored at the
+  // right edge.
+  while (tabStrip.firstChild && tabStrip.firstChild !== newTabBtn) {
+    tabStrip.removeChild(tabStrip.firstChild);
+  }
+
+  const PROTO = location.protocol === "https:" ? "wss:" : "ws:";
+  const wsPath = PROTO + "//" + location.host + "/ws";
+
+  // Capped exponential backoff for WS reconnects. Same constants the
+  // pre-tabs manager used so the visual feels identical.
+  const BACKOFF_MIN_MS = 250;
+  const BACKOFF_MAX_MS = 30000;
+
+  /** Map<TabId, TabState> — single source of truth for tab state. */
+  const tabs = new Map();
+  /** Currently-rendered tab id (the one whose .pane.is-active is on). */
+  let activeTabId = null;
+
+  let ws = null;
+  let attempt = 0;
+  let reconnectTimer = null;
+  let stopped = false;
+
+  const theme = {
+    background: "#0e1116",
+    foreground: "#e6edf3",
+    cursor: "#e6edf3",
+    selectionBackground: "#264f78",
+  };
+  const fontConfig = {
     cursorBlink: true,
     fontFamily:
       '"JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas, monospace',
     fontSize: 14,
     lineHeight: 1.2,
     scrollback: 10000,
-    theme: {
-      background: "#0e1116",
-      foreground: "#e6edf3",
-      cursor: "#e6edf3",
-      selectionBackground: "#264f78",
-    },
-  });
-  const fitAddon =
-    typeof window.FitAddon !== "undefined"
-      ? new window.FitAddon.FitAddon()
-      : null;
-  if (fitAddon) term.loadAddon(fitAddon);
-  term.open(host);
-
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const wsPath = proto + "//" + location.host + "/ws";
-
-  // Capped exponential backoff for WS reconnects. The geometric floor stops
-  // the very first retry from feeling instant; the cap keeps a long server
-  // outage from spinning so tight it pegs a CPU.
-  const BACKOFF_MIN_MS = 250;
-  const BACKOFF_MAX_MS = 30000;
-
-  let ws = null;
-  let attempt = 0;
-  let reconnectTimer = null;
-  let stopped = false;
+    theme,
+  };
 
   function setStatus(text, cls) {
     status.textContent = text;
@@ -67,19 +90,75 @@
     ws.send(JSON.stringify(obj));
   }
 
-  function reportDims() {
-    if (!fitAddon) return { cols: term.cols, rows: term.rows };
-    const proposed = fitAddon.proposeDimensions();
-    return proposed || { cols: term.cols, rows: term.rows };
+  function applyLocalRename(tabId, label) {
+    const tab = tabs.get(tabId);
+    if (!tab) return;
+    tab.label = label;
+    const span = tab.tabBtn.btn.querySelector(".tab-name");
+    if (span) span.textContent = label;
   }
 
+  function switchToTab(tabId) {
+    if (activeTabId === tabId) {
+      // No-op, but still refit + report dims so the active terminal
+      // recovers after a layout shift that did not come through
+      // window.resize (e.g. preview pane toggling).
+      refitActiveAndReport();
+      return;
+    }
+    if (activeTabId != null) {
+      const prev = tabs.get(activeTabId);
+      if (prev) {
+        prev.pane.classList.remove("is-active");
+        prev.tabBtn.btn.classList.remove("is-active");
+      }
+    }
+    const next = tabs.get(tabId);
+    if (!next) {
+      activeTabId = null;
+      return;
+    }
+    next.pane.classList.add("is-active");
+    next.tabBtn.btn.classList.add("is-active");
+    activeTabId = tabId;
+    // Defer fit+focus until the new flex layout has settled. rAF
+    // ensures CSS painted the visible pane before xterm measures.
+    requestAnimationFrame(() => {
+      refitActiveAndReport();
+      try {
+        next.term.focus();
+      } catch (_) {}
+    });
+  }
+
+  function refitActiveAndReport() {
+    if (activeTabId == null) {
+      dimsEl.textContent = "–";
+      return;
+    }
+    const tab = tabs.get(activeTabId);
+    if (!tab || !tab.fitAddon) return;
+    tab.fitAddon.fit();
+    const proposed = tab.fitAddon.proposeDimensions();
+    if (!proposed) return;
+    dimsEl.textContent = `${proposed.cols}×${proposed.rows}`;
+    sendEnvelope({
+      type: "resize",
+      tab_id: activeTabId,
+      cols: proposed.cols,
+      rows: proposed.rows,
+    });
+  }
+
+  // Expose manual refit helper so the preview iframe / sidebar etc.
+  // can ask the active terminal to re-measure its host box after a
+  // layout change that did not go through window.resize.
+  window.__browsterm_refit = () => {
+    refitActiveAndReport();
+  };
+
   function nextBackoffMs() {
-    const exp = Math.min(
-      BACKOFF_MAX_MS,
-      BACKOFF_MIN_MS * Math.pow(2, attempt)
-    );
-    // Jitter up to 25% of the current delay (capped) so concurrent tabs do
-    // not hammer the server in lockstep.
+    const exp = Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS * Math.pow(2, attempt));
     const jitter = Math.floor(Math.random() * Math.min(exp * 0.25, 1000));
     return exp + jitter;
   }
@@ -105,76 +184,321 @@
     ws.binaryType = "arraybuffer";
 
     ws.addEventListener("open", () => {
-      // On pagehide we close the socket while it is still connecting; the
-      // browser will still fire `open` once before `close`. Guard so we
-      // don't briefly mark the workspace as "connected" while tearing down.
+      // On pagehide we close the socket while it is still connecting;
+      // the browser will still fire `open` once before `close`. Guard
+      // so we don't briefly mark the workspace as "connected" while
+      // tearing down.
       if (stopped) {
         ws.close();
         return;
       }
       attempt = 0;
       setStatus("connected", "connected");
-      if (fitAddon) fitAddon.fit();
-      const { cols, rows } = reportDims();
-      dims.textContent = `${cols}×${rows}`;
-      // The server treats the first envelope we send as the cue to spawn
-      // the PTY at our actual grid size. Sending `ready` (instead of
-      // `resize`) is what eliminates the banner-flash Tier-1 bug: the PTY
-      // never paints a frame at 80x24 before it is told the right dims.
-      sendEnvelope({ type: "ready", cols, rows });
-      term.focus();
+      // Tabs are server-driven from here: hello lists the current
+      // roster, then create-tab/close-tab/rename envelopes mutate it.
     });
 
     ws.addEventListener("close", () => {
       ws = null;
+      // Server keeps tabs alive across WS drops; a greet re-hello
+      // reconciling the strip will arrive when the new socket opens.
       scheduleReconnect("disconnected");
     });
 
     ws.addEventListener("error", () => {
-      // Browsers fire 'error' immediately before 'close' on a failed connect;
-      // let 'close' own the timer so we never schedule twice.
       setStatus("disconnected — reconnecting…", "reconnecting");
     });
 
     ws.addEventListener("message", (event) => {
       if (typeof event.data === "string") {
-        term.write(event.data);
+        try {
+          handleServerJson(JSON.parse(event.data));
+        } catch (_) {
+          /* malformed JSON — ignore */
+        }
+        return;
+      }
+      // Binary frame: first 4 bytes = u32 LE tab_id, then PTY bytes.
+      const u8 = new Uint8Array(event.data);
+      if (u8.byteLength < 4) return;
+      const tabId = new DataView(u8.buffer, u8.byteOffset, 4).getUint32(0, true);
+      const payload = u8.subarray(4);
+      const tab = tabs.get(tabId);
+      if (tab) tab.term.write(payload);
+    });
+  }
+
+  function handleServerJson(msg) {
+    if (!msg || typeof msg.type !== "string") return;
+    switch (msg.type) {
+      case "hello": {
+        // Reconcile: drop any locally-tracked tabs the server doesn't
+        // list (defensive — possible during relaunch with a stale
+        // local state) and ensure every server-listed tab has a
+        // matching local entry.
+        const incomingIds = new Set((msg.tabs || []).map((t) => t.tab_id));
+        for (const id of Array.from(tabs.keys())) {
+          if (!incomingIds.has(id)) removeLocalTab(id);
+        }
+        for (const t of msg.tabs || []) {
+          ensureLocalTab(t.tab_id, t.label);
+        }
+        if (activeTabId == null && msg.tabs && msg.tabs.length > 0) {
+          switchToTab(msg.tabs[0].tab_id);
+        } else {
+          refitActiveAndReport();
+        }
+        break;
+      }
+      case "tab-ack": {
+        ensureLocalTab(msg.tab_id, msg.label);
+        switchToTab(msg.tab_id);
+        break;
+      }
+      case "tab-event": {
+        if (msg.kind === "closed") {
+          removeLocalTab(msg.tab_id);
+        } else if (msg.kind === "renamed" && msg.label != null) {
+          applyLocalRename(msg.tab_id, msg.label);
+        }
+        break;
+      }
+    }
+  }
+
+  function ensureLocalTab(tabId, label) {
+    if (tabs.has(tabId)) {
+      if (label && tabs.get(tabId).label !== label) {
+        applyLocalRename(tabId, label);
+      }
+      return tabs.get(tabId);
+    }
+
+    const pane = document.createElement("section");
+    pane.className = "pane";
+    pane.dataset.tabId = String(tabId);
+    const host = document.createElement("div");
+    host.className = "terminal-host";
+    pane.appendChild(host);
+    panesHost.appendChild(pane);
+
+    const tabBtn = makeTabButton(tabId, label);
+    // Insert the new tab button right before newTabBtn so the ＋
+    // control always trails the strip.
+    tabStrip.insertBefore(tabBtn.btn, newTabBtn);
+
+    const term = new window.Terminal(fontConfig);
+    const fitAddon =
+      typeof window.FitAddon !== "undefined"
+        ? new window.FitAddon.FitAddon()
+        : null;
+    if (fitAddon) term.loadAddon(fitAddon);
+    term.open(host);
+
+    const tab = {
+      tab_id: tabId,
+      label,
+      term,
+      host,
+      pane,
+      tabBtn,
+      fitAddon,
+    };
+
+    // Per-Terminal handlers capture `tabId` via closure so xterm.js
+    // events route by tab_id even when multiple terminals are alive.
+    term.onData((data) => {
+      sendEnvelope({ type: "input", tab_id: tabId, data });
+    });
+    term.onResize(({ cols, rows }) => {
+      if (tabId === activeTabId) {
+        dimsEl.textContent = `${cols}×${rows}`;
+      }
+      sendEnvelope({ type: "resize", tab_id: tabId, cols, rows });
+    });
+
+    tabs.set(tabId, tab);
+    return tab;
+  }
+
+  function removeLocalTab(tabId) {
+    const tab = tabs.get(tabId);
+    if (!tab) return;
+    try {
+      if (tab.fitAddon) tab.fitAddon.dispose();
+    } catch (_) {}
+    try {
+      tab.term.dispose();
+    } catch (_) {}
+    if (tab.pane.parentNode) tab.pane.parentNode.removeChild(tab.pane);
+    if (tab.tabBtn.btn.parentNode) {
+      tab.tabBtn.btn.parentNode.removeChild(tab.tabBtn.btn);
+    }
+    tabs.delete(tabId);
+    // If the active tab is the one we just removed, hand focus to the
+    // closest surviving neighbour: same direction the strip already
+    // reads (left for left, right for right). Surviving smaller ids
+    // take precedence so chain-closes from the right don't make focus
+    // jump all the way to the left edge.
+    if (activeTabId === tabId) {
+      const remaining = Array.from(tabs.keys()).sort((a, b) => a - b);
+      if (remaining.length === 0) {
+        activeTabId = null;
+        dimsEl.textContent = "–";
+        refitActiveAndReport();
+        return;
+      }
+      const smaller = remaining.filter((id) => id < tabId);
+      const larger = remaining.filter((id) => id > tabId);
+      let nextId;
+      if (smaller.length > 0) {
+        nextId = smaller[smaller.length - 1];
       } else {
-        // ArrayBuffer: wrap and pass to xterm.js, which accepts Uint8Array for
-        // graphic-protocol data without UTF-8 lossy conversion.
-        term.write(new Uint8Array(event.data));
+        nextId = larger[0];
+      }
+      switchToTab(nextId);
+    }
+  }
+
+  function makeTabButton(tabId, label) {
+    const btn = document.createElement("button");
+    btn.className = "tab";
+    btn.type = "button";
+    btn.dataset.tabId = String(tabId);
+
+    const nameSpan = document.createElement("span");
+    nameSpan.className = "tab-name";
+    nameSpan.textContent = label || "";
+    btn.appendChild(nameSpan);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "tab-close";
+    closeBtn.type = "button";
+    closeBtn.title = "Close tab (Ctrl+W)";
+    closeBtn.setAttribute("aria-label", "Close tab");
+    closeBtn.textContent = "✕";
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      sendEnvelope({ type: "close-tab", tab_id: tabId });
+    });
+    btn.appendChild(closeBtn);
+
+    btn.addEventListener("click", () => switchToTab(tabId));
+    btn.addEventListener("dblclick", (e) => {
+      e.preventDefault();
+      startRename(tabId, nameSpan);
+    });
+
+    return { btn, nameSpan };
+  }
+
+  function startRename(tabId, nameSpan) {
+    if (!nameSpan) return;
+    const tab = tabs.get(tabId);
+    if (!tab) return;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = tab.label;
+    input.size = Math.max(8, Math.min(40, tab.label.length + 2));
+    let committed = false;
+    const parentBtn = nameSpan.parentElement;
+    parentBtn.classList.add("is-renaming");
+    nameSpan.textContent = "";
+    nameSpan.appendChild(input);
+    input.focus();
+    input.select();
+
+    const finish = (commit) => {
+      if (committed) return;
+      committed = true;
+      const value = (input.value || "").trim();
+      // Drop the input; restore the label span.
+      nameSpan.textContent = tab.label;
+      parentBtn.classList.remove("is-renaming");
+      if (commit && value && value !== tab.label) {
+        sendEnvelope({ type: "rename", tab_id: tabId, label: value });
+      }
+    };
+
+    input.addEventListener("blur", () => finish(true));
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        input.blur();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        finish(false);
       }
     });
   }
 
-  term.onData((data) => sendEnvelope({ type: "input", data }));
+  function createNewTab(label) {
+    // Pull dims from the current active tab if any so the new PTY
+    // starts at the user's grid and avoids the Tier-1 banner flash.
+    let cols = 80;
+    let rows = 24;
+    if (activeTabId != null) {
+      const tab = tabs.get(activeTabId);
+      if (tab) {
+        if (tab.fitAddon) {
+          const p = tab.fitAddon.proposeDimensions();
+          if (p) {
+            cols = p.cols;
+            rows = p.rows;
+          }
+        } else {
+          cols = tab.term.cols;
+          rows = tab.term.rows;
+        }
+      }
+    }
+    sendEnvelope({
+      type: "create-tab",
+      cols,
+      rows,
+      label: typeof label === "string" ? label : undefined,
+    });
+  }
 
-  term.onResize(({ cols, rows }) => {
-    dims.textContent = `${cols}×${rows}`;
-    sendEnvelope({ type: "resize", cols, rows });
-  });
+  function cycleActive(direction) {
+    const ids = Array.from(tabs.keys()).sort((a, b) => a - b);
+    if (ids.length === 0) return;
+    let idx = activeTabId == null ? -1 : ids.indexOf(activeTabId);
+    // Modulo so direction wraps from end to start and vice versa.
+    idx = (idx + direction + ids.length) % ids.length;
+    switchToTab(ids[idx]);
+  }
 
-  window.addEventListener("resize", () => {
-    if (fitAddon) {
-      fitAddon.fit();
-      const { cols, rows } = reportDims();
-      sendEnvelope({ type: "resize", cols, rows });
+  // Global keyboard shortcuts. Ctrl/Cmd+T : new tab; Ctrl/Cmd+W : close
+  // active tab; Ctrl/Cmd+Tab : cycle. Skip when focus is in an input
+  // (rename editing) or text area so the keystroke still works as typed.
+  window.addEventListener("keydown", (e) => {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    const tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    const k = e.key.toLowerCase();
+    if (k === "t") {
+      e.preventDefault();
+      createNewTab();
+    } else if (k === "w") {
+      e.preventDefault();
+      if (activeTabId != null) {
+        sendEnvelope({ type: "close-tab", tab_id: activeTabId });
+      }
+    } else if (e.key === "Tab") {
+      e.preventDefault();
+      cycleActive(e.shiftKey ? -1 : +1);
     }
   });
 
-  // Expose a manual refit so other parts of the workspace (the file
-  // preview pane) can ask the terminal to re-measure its host box after
-  // a layout change that does not go through `window.resize` (i.e. when
-  // a sibling flex child appears or disappears).
-  window.__browsterm_refit = () => {
-    if (!fitAddon) return;
-    fitAddon.fit();
-    const { cols, rows } = reportDims();
-    sendEnvelope({ type: "resize", cols, rows });
-  };
+  newTabBtn.addEventListener("click", () => createNewTab());
 
-  // Stop reconnecting once the page is going away; otherwise a closed tab
-  // would keep its reconnect timer alive in the background.
+  window.addEventListener("resize", () => {
+    refitActiveAndReport();
+  });
+
+  // Stop reconnecting once the page is going away; otherwise a closed
+  // tab would keep its reconnect timer alive in the background.
   window.addEventListener("pagehide", () => {
     stopped = true;
     if (reconnectTimer != null) {
