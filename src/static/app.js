@@ -199,6 +199,7 @@
 
   const statusEl = document.getElementById("fs-status");
   const refreshEl = document.getElementById("fs-refresh");
+  const showHiddenEl = document.getElementById("fs-show-hidden");
   const breadcrumbsEl = document.getElementById("breadcrumbs");
   const entriesEl = document.getElementById("entries");
 
@@ -210,6 +211,11 @@
     currentPath: null,
     inFlight: 0,
     pollHandle: null,
+    // Session-local toggle for POSIX dotfiles. Vision §2 names this as
+    // a first-class sidebar feature; the value travels on every request
+    // to /api/fs/list so the server filters cheaply (saves round-tripping
+    // hidden entries a user has explicitly opted out of seeing).
+    showHidden: showHiddenEl ? !!showHiddenEl.checked : true,
   };
 
   function setStatus(text) {
@@ -226,7 +232,13 @@
     const ticket = ++sidebar.inFlight;
     setStatus("loading\u2026");
     try {
-      const url = "/api/fs/list?path=" + encodeURIComponent(target);
+      // `show_hidden` rides on every navigate so the server never hands
+      // the browser entries the user has toggled off. `true` is the
+      // MVP default (also the server's `serde(default)` fallback); we
+      // only send it explicitly when the user flips the toggle off, so
+      // the URL stays short for the common case.
+      let url = "/api/fs/list?path=" + encodeURIComponent(target);
+      if (!sidebar.showHidden) url += "&show_hidden=false";
       const res = await fetch(url, { headers: { Accept: "application/json" } });
       if (ticket !== sidebar.inFlight) return; // a newer call superseded us
       if (!res.ok) {
@@ -249,7 +261,14 @@
       sidebar.currentPath = data.path;
       renderBreadcrumbs();
       renderEntries(data.entries);
-      setStatus(`${data.entries.length} item${data.entries.length === 1 ? "" : "s"}`);
+      // Surface the active filter inline so the count never reads as
+      // ambiguous. Without this, a user toggling dotfiles away sees the
+      // same `"5 items"` text as before and wonders why their `ls -la`
+      // count disagrees; the parenthetical clamp makes the source of
+      // the discrepancy obvious at a glance.
+      setStatus(
+        `${data.entries.length} item${data.entries.length === 1 ? "" : "s"}${sidebar.showHidden ? "" : " (hidden filtered)"}`
+      );
     } catch (err) {
       if (ticket !== sidebar.inFlight) return;
       setStatus("error");
@@ -370,6 +389,16 @@
   }
 
   refreshEl.addEventListener("click", () => refresh());
+
+  if (showHiddenEl) {
+    // Toggle fires a refresh against the current path. We do not call
+    // `navigate("/")` here so a user mid-tree who flips the dotfile
+    // visibility sees the change in place without losing their spot.
+    showHiddenEl.addEventListener("change", () => {
+      sidebar.showHidden = !!showHiddenEl.checked;
+      refresh();
+    });
+  }
 
   // Poll. Pause when the tab is hidden so a backgrounded workspace does
   // not hammer the FS every five seconds. Stop entirely on pagehide so

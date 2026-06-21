@@ -114,6 +114,29 @@ body {
   background: rgba(88, 166, 255, 0.08);
 }
 
+.fs-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+  color: var(--muted);
+}
+
+.fs-toggle input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.fs-toggle:hover {
+  color: var(--fg);
+}
+
+.fs-toggle input[type="checkbox"]:checked + span {
+  color: var(--fg);
+}
+
 .breadcrumbs {
   display: flex;
   flex-wrap: nowrap;

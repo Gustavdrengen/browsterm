@@ -24,6 +24,11 @@
       <aside class="sidebar" aria-label="Files">
         <header class="sidebar-tools">
           <span id="fs-status" class="muted">…</span>
+          <span class="spacer"></span>
+          <label class="fs-toggle" title="Show dotfiles (files whose name starts with a dot)">
+            <input type="checkbox" id="fs-show-hidden" checked />
+            <span>show hidden</span>
+          </label>
           <button type="button" id="fs-refresh" title="Refresh">↻</button>
         </header>
         <nav id="breadcrumbs" class="breadcrumbs" aria-label="Path"></nav>

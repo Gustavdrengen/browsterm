@@ -35,6 +35,18 @@ const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Debug, Deserialize)]
 pub struct FsRequest {
     pub path: String,
+    /// When `true`, include entries whose names start with `.`. The default
+    /// stays `true` for backward compatibility with the MVP behaviour
+    /// ("hidden files visible by default") called out in the file-explorer
+    /// commit's state-of-play entry. Vision §2 names this as a sidebar
+    /// toggle; the checkbox in `src/static/index.html` flips it session-
+    /// locally and the client passes the value on every `/api/fs/list`.
+    #[serde(default = "default_show_hidden")]
+    pub show_hidden: bool,
+}
+
+fn default_show_hidden() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -110,10 +122,16 @@ impl IntoResponse for FsError {
     }
 }
 
-/// `GET /api/fs/list?path=...` — list one directory.
+/// `GET /api/fs/list?path=...&show_hidden=...` — list one directory.
 ///
 /// If `path` is empty, the listing defaults to the binary's current
 /// working directory — the same place the user typed `browsterm` from.
+///
+/// `show_hidden` (default `true` for backward compatibility with the
+/// MVP behaviour) toggles POSIX dotfile visibility. The sidebar's
+/// checkbox in `src/static/index.html` flips it session-locally; the
+/// value rides on every request so the server filters cheaply rather
+/// than round-tripping every dotfile a user has opted out of seeing.
 pub async fn list(Query(req): Query<FsRequest>) -> Result<Json<ListResponse>, FsError> {
     let path_str = if req.path.is_empty() {
         std::env::current_dir()
@@ -130,7 +148,8 @@ pub async fn list(Query(req): Query<FsRequest>) -> Result<Json<ListResponse>, Fs
         .map_err(map_io_to_fs)?;
 
     let dir_for_task = canonical.clone();
-    let entries = tokio::task::spawn_blocking(move || read_and_sort(dir_for_task))
+    let show_hidden = req.show_hidden;
+    let entries = tokio::task::spawn_blocking(move || read_and_sort(dir_for_task, show_hidden))
         .await
         .map_err(|e| FsError::Internal(format!("blocking join: {e}")))??;
 
@@ -198,10 +217,18 @@ fn map_io_to_fs(err: std::io::Error) -> FsError {
     }
 }
 
-fn read_and_sort(dir: PathBuf) -> Result<Vec<FsEntry>, FsError> {
+fn read_and_sort(dir: PathBuf, show_hidden: bool) -> Result<Vec<FsEntry>, FsError> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&dir).map_err(map_io_to_fs)? {
         let entry = entry.map_err(|e| FsError::Internal(e.to_string()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // POSIX dotfile convention: filter by *name* only, so a dotfile
+        // symlink (e.g. `.config/nvim` linking into the dotfiles repo)
+        // is treated like the dotfile it is named to be, regardless of
+        // what its target resolves to.
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
         let meta = std::fs::symlink_metadata(entry.path())
             .map_err(|e| FsError::Internal(e.to_string()))?;
         let ft = meta.file_type();
@@ -251,7 +278,7 @@ fn read_and_sort(dir: PathBuf) -> Result<Vec<FsEntry>, FsError> {
             (None, None)
         };
         entries.push(FsEntry {
-            name: entry.file_name().to_string_lossy().into_owned(),
+            name,
             is_dir,
             is_file,
             is_symlink,
@@ -330,11 +357,59 @@ mod tests {
     #[test]
     fn sort_layout_dirs_first_then_files_case_insensitive_no_follow() {
         let dir = make_temp_layout();
-        let entries = read_and_sort(dir.path().to_path_buf()).unwrap();
+        // `show_hidden = true` is the MVP default; the dotfile stays in
+        // the sort order so the existing naming invariant is preserved.
+        let entries = read_and_sort(dir.path().to_path_buf(), true).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         // Directories first; within each group, case-insensitive alphabetical.
         // Hidden files are visible by default per the MVP.
         assert_eq!(names, vec!["Folder", ".hidden", "A_file.txt", "z_file.txt"]);
+    }
+
+    #[test]
+    fn hidden_entries_filtered_when_show_hidden_false() {
+        let dir = make_temp_layout();
+        // `show_hidden = false` (the sidebar-toggle) strips dotfiles from
+        // the listing for every kind — regular files, directories, and
+        // symlinks (the symlink case isn't in `make_temp_layout`, but
+        // `is_hidden_name` ignores file type on purpose, so the predicate
+        // behaves the same — verified separately by the symlink test).
+        let entries = read_and_sort(dir.path().to_path_buf(), false).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&".hidden"));
+        assert_eq!(names, vec!["Folder", "A_file.txt", "z_file.txt"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hidden_symlink_filtered_when_show_hidden_false_keeps_target_flags() {
+        // A symlink to a regular file still starts with `.` so the same
+        // dotfile predicate applies, *and* this test verifies the
+        // target-kind probing still runs on the symlinks that survive
+        // the filter. Both code paths share the per-entry loop in
+        // `read_and_sort`, so we want a regression that catches any
+        // early-return that would skip the std::fs::metadata call.
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        std::fs::write(&real, b"x").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join(".link")).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("visible_link")).unwrap();
+
+        let entries = read_and_sort(dir.path().to_path_buf(), false).unwrap();
+        // Assert on presence/absence, not exact ordering — the sort is
+        // an implementation detail the test should not depend on.
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"real"));
+        assert!(names.contains(&"visible_link"));
+        assert!(!names.contains(&".link"));
+        // The surviving symlink must still carry its target-kind
+        // flags; the sidebar relies on this to decide openFile vs
+        // navigate. If the dotfile filter ever grew an early-skip
+        // that bypasses the `std::fs::metadata` call, this catches it.
+        let vis = entries.iter().find(|e| e.name == "visible_link").unwrap();
+        assert!(vis.is_symlink);
+        assert_eq!(vis.target_is_file, Some(true));
+        assert_eq!(vis.target_is_dir, Some(false));
     }
 
     #[test]
@@ -345,7 +420,7 @@ mod tests {
         std::fs::write(&real, b"x").unwrap();
         std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
 
-        let entries = read_and_sort(dir.path().to_path_buf()).unwrap();
+        let entries = read_and_sort(dir.path().to_path_buf(), true).unwrap();
         let link = entries.iter().find(|e| e.name == "link").unwrap();
         assert!(link.is_symlink);
         assert!(!link.is_dir);
@@ -373,7 +448,7 @@ mod tests {
         std::fs::create_dir(&target_dir).unwrap();
         std::os::unix::fs::symlink(&target_dir, dir.path().join("into")).unwrap();
 
-        let entries = read_and_sort(dir.path().to_path_buf()).unwrap();
+        let entries = read_and_sort(dir.path().to_path_buf(), true).unwrap();
         let link = entries.iter().find(|e| e.name == "into").unwrap();
         assert!(link.is_symlink);
         assert_eq!(link.target_is_dir, Some(true));
@@ -386,7 +461,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::os::unix::fs::symlink("/no/such/target", dir.path().join("dangling")).unwrap();
 
-        let entries = read_and_sort(dir.path().to_path_buf()).unwrap();
+        let entries = read_and_sort(dir.path().to_path_buf(), true).unwrap();
         let link = entries.iter().find(|e| e.name == "dangling").unwrap();
         assert!(link.is_symlink);
         assert!(link.symlink_target.is_some());
@@ -405,7 +480,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::os::unix::fs::symlink("/dev/null", dir.path().join("null_link")).unwrap();
 
-        let entries = read_and_sort(dir.path().to_path_buf()).unwrap();
+        let entries = read_and_sort(dir.path().to_path_buf(), true).unwrap();
         let link = entries.iter().find(|e| e.name == "null_link").unwrap();
         assert!(link.is_symlink);
         assert_eq!(link.target_is_dir, Some(false));
@@ -425,7 +500,7 @@ mod tests {
         // The top-level read_dir must return quickly and never recurse, so
         // this should never deadlock regardless of cycle depth.
         let started = std::time::Instant::now();
-        let entries = read_and_sort(dir.path().to_path_buf()).unwrap();
+        let entries = read_and_sort(dir.path().to_path_buf(), true).unwrap();
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"sub_a"));
@@ -485,6 +560,7 @@ mod tests {
         std::env::set_current_dir(dir.path()).unwrap();
         let outcome = list(Query(FsRequest {
             path: String::new(),
+            show_hidden: true,
         }))
         .await;
         std::env::set_current_dir(&saved).unwrap();
@@ -530,6 +606,7 @@ mod tests {
             std::fs::write(&p, body).unwrap();
             let res = file(Query(FsRequest {
                 path: p.to_string_lossy().into_owned(),
+                show_hidden: true,
             }))
             .await
             .expect("file endpoint should succeed");
@@ -561,6 +638,7 @@ mod tests {
         std::fs::write(&p, &original).unwrap();
         let res = file(Query(FsRequest {
             path: p.to_string_lossy().into_owned(),
+            show_hidden: true,
         }))
         .await
         .expect("file endpoint should succeed");
