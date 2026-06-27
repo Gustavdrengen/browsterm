@@ -157,6 +157,25 @@ The agent appends a dated entry here after every state-of-play gate. The section
 
 > **Decision:** Multiplex all tabs over a single `/ws` so the existing reconnect state machine and the one-status-cell UX stay put, and the future "open text file in neovim on a new tab" workflow lands on the same envelope set without re-shaping the wire. **Tier:** T2. **Evidence:** `specs/tabs.md` is the wire-format contract; `cargo test --release` shows 28/28 unit tests + 9 new envelope and framing regressions; smoke run reproduces `/healthz`, `/`, and `/app.js` after build. **Trade-off (handled in code):** `SplitSink` is `!Clone`, so per-tab forwarder tasks can't all share it directly; sidestepped with a fan-in `mpsc::unbounded_channel` drained serially by the WS handler. Scrollback survives the WS drop *server-side* (PTY still alive) but xterm.js rebuilds a fresh Terminal on reconnect — Tier-3 polish.
 
+#### - [2026-06-27] Tier-1 WSL browser launch
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` (no warnings) + `cargo test --release` (31/31 pass, +3 in `browser::tests`: `wsl_kernel_string_contains_microsoft_marker` exercises the substring-match accepted by the detector, `wsl_env_marker_triggers` mutates `WSL_DISTRO_NAME` to flip `is_wsl()` true and restores prior env, `non_wsl_kernel_is_rejected` asserts the vanilla `6.6.0-15-generic` kernel string is not matched).
+  - `src/browser.rs::open_url` now resolves in this order: `BROWSER` env override → on WSL, prefer `wslview` (the canonical Windows-side default-browser handoff), falling back to `cmd.exe /c start "" <url>` via the interop bridge, falling back to `open::that_detached` for everything else. `BROWSER` keeps its first-class status so users can still pin a different default per environment.
+  - `is_wsl()` reads `/proc/sys/kernel/osrelease` for `microsoft` / `wsl` substring markers and OR's that with `WSL_DISTRO_NAME` / `WSLENV` env presence (the env probe covers WSL1 where the kernel string is unbranded).
+  - Smoke (`./target/release/browsterm --no-browser --port 8786` on the WSL dev host): `/healthz → 200`, `/ → 200`, `/app.js → 200`. With `--no-browser` the WSL branch is uninvolved, confirming we did not regress the suppress path. The actual `wslview` invocation is a manual user-exercise step (the test host has no X server, so the visual smoke is "does it open Edge on the Windows host" — exercised once by the programmer, not automated).
+
+- **Broken / rough / missing** (user-visible):
+  - **No structured error when every WSL branch fails.** If `wslview` and `cmd.exe` both fail (e.g. a WSL install without the interop bridge), we fall through silently and only the `tracing::warn!` carries the reason. A future Tier-3 polish could surface a toast with the failure reason so the user knows why their desktop browser didn't open.
+  - **No `--browser` CLI flag.** A user explicitly trying to steer the Windows-side browser (e.g. `browsterm --browser msedge`) currently has to set `BROWSER=wslview msedge ...` — clunkier than it needs to be. Carries forward to Tier-3 UX polish.
+  - **`is_wsl()` doesn't differentiate WSL1 vs WSL2.** If a WSL1 user logs out and the interop is disabled, `cmd.exe` may genuinely not exist on the path. The fallback chain still degrades gracefully but the user-visible error could mention the WSL1-specific install hint. Carries forward.
+
+- **Feels bad** (code is there but a user would notice):
+  - The detector is conservative with two signals so the kernel-probe false positive on something like a CBL-Mariner kernel string in a container is bounded. Logs at `debug!` give operators a paper trail without nagging at `info!`. Acceptable.
+  - `BROWSER=wslview ...` was always the documented escape hatch; the *default* behaviour has shifted from "open in WSL re.exe shell" to "open in Windows browser", which is the right call per vision principle #8 but worth noting in user-facing release notes when the next public cut ships.
+
+> **Decision:** Replace `open::that_detached` with a WSL-aware cascade so Browsterm on WSL opens the URL in the *Windows* default browser, matching vision principle #8. **Tier:** T1. **Evidence:** `src/browser.rs::is_wsl` + `open_wsl_windows_browser` + the new unit tests; smoke run on the WSL dev host reproduces `/healthz` / `/` / `/app.js` cleanly; the original INBOX entry "Why does it open in a WSL browser, when running in WSL, it should open in my windows browser." is now resolved and dropped from `INBOX.md`. **Trade-off:** a user who actually *wanted* the WSL-side browser can re-enable it with `BROWSER=xdg-open ...` (the env override keeps the first-class escape hatch). Roster cap, scrollback-on-reconnect, and a `--browser` flag carry forward to later sessions.
+
 #### - [2026-06-21] Tier-3 preview-pane keyboard navigation
 
 - **Works** (verifiable as a user would experience it):
