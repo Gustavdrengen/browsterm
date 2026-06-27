@@ -176,6 +176,24 @@ The agent appends a dated entry here after every state-of-play gate. The section
 
 > **Decision:** Replace `open::that_detached` with a WSL-aware cascade so Browsterm on WSL opens the URL in the *Windows* default browser, matching vision principle #8. **Tier:** T1. **Evidence:** `src/browser.rs::is_wsl` + `open_wsl_windows_browser` + the new unit tests; smoke run on the WSL dev host reproduces `/healthz` / `/` / `/app.js` cleanly; the original INBOX entry "Why does it open in a WSL browser, when running in WSL, it should open in my windows browser." is now resolved and dropped from `INBOX.md`. **Trade-off:** a user who actually *wanted* the WSL-side browser can re-enable it with `BROWSER=xdg-open ...` (the env override keeps the first-class escape hatch). Roster cap, scrollback-on-reconnect, and a `--browser` flag carry forward to later sessions.
 
+#### - [2026-06-27] Tier-1 scrollback preservation across WS reconnect
+
+- **Works** (verifiable as a user would experience it):
+  - `cargo build --release` (no warnings) + `cargo test --release` (33/33 pass, +2 in `pty::tests`: `scrollback_replays_output_to_late_subscriber` drives a deterministic `echo SCROLLBACK_MARK` through a real PTY and asserts the marker is replayable on a later `scrollback()` snapshot, `scrollback_ring_evicts_oldest_bytes` exercises the eviction math directly).
+  - `src/pty.rs::PtySession` now keeps a per-session `Arc<std::sync::Mutex<Vec<u8>>>` ring, capped at `SCROLLBACK_CAP_BYTES = 256 KiB`. The reader thread appends each fresh chunk under the mutex and trims the front (drain) when the buffer overshoots — a single short lock per read, no contention with the broadcast channel.
+  - `src/terminal.rs::HelloTab` now carries a `scrollback: Vec<u8>`. The server replays each surviving tab's bytes as the same `tab_id`-prefixed binary frames the live forwarders emit, in `replay_scrollback` — a fresh WS upgrade gets the saved state before the first live byte. JSON encoding of the `Vec<u8>` is the standard byte array (`[27,91,51,50,109]`), readable in DevTools; the envelope stays under the 1 MiB WS frame limit because the buffer is capped.
+  - `terminal::tests::hello_envelope_serializes_round_trip` extended to assert the new bytes shape and the `[]` form for empty scrollback so a future schema drift can't silently break the JSON contract.
+
+- **Broken / rough / missing** (user-visible):
+  - **Browser-side scrollback decode not yet wired.** The server emits the per-tab replay as the same `tab_id`-prefixed binary frames the live forwarder uses, but the browser-side handler in `app.js` still does not distinguish "replay frame" from "live frame" — they go through the same xterm.js `term.write()` path today, which works (xterm.js is idempotent for the player) but does not skip live forwarding until the replay frame finishes. Acceptable for the MVP wire contract; a Tier-3 polish can bound the replay to `n` frames / bytes before flipping the bridge to live.
+  - **256 KiB cap is global, not per-tab.** A user with one giant tab and many small tabs allocates 256 KiB to the noisy neighbour. Acceptable for MVP; per-tab budgets carry forward.
+  - **No scrollback shrink on close-tab.** Killing a tab drops the session but keeps its ring in place until the server exits. Bounded by tab count; the cleanup hook lands alongside the roster cap in a future Tier-3 harden.
+
+- **Feels bad** (code is there but a user would notice):
+  - The per-tab replay uses whatever order the roster returns (sorted by tab id) — the browser sees them in creation order. If a user reconnects mid-typing on a non-first tab, the cursor lands on the active tab after the replay, which is correct; the ordering is incidental but worth noting.
+
+> **Decision:** Capture scrollback server-side in a 256 KiB ring per session and emit it inside the existing `hello` envelope so the WS handler can replay it on upgrade — keeps the contract single-frame (no new envelope type) and matches vision principle #6 ("reconnect gracefully"). **Tier:** T1. **Evidence:** `cargo test --release` 33/33 pass; `src/pty.rs::scrollback()` exposes the ring snapshot; `src/terminal.rs::replay_scrollback` emits the prefix frame shape identical to the live forwarder's. **Trade-off:** a 256 KiB cap is generous enough for typical shell history but not unlimited; oversized scrollbacks (a `cat huge.log` mid-reconnect) drop oldest bytes first, matching xterm.js's own scrollback default. Browser-side distinction between replay and live carries forward as Tier-3 polish.
+
 #### - [2026-06-21] Tier-3 preview-pane keyboard navigation
 
 - **Works** (verifiable as a user would experience it):

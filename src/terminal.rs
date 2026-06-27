@@ -74,11 +74,20 @@ enum ServerMessage {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct HelloTab {
     tab_id: TabId,
     label: String,
+    /// Per-tab scrollback snapshot for replay on WS reconnect. The
+    /// browser uses this to seed xterm.js with the last
+    /// SCROLLBACK_CAP_BYTES of visible state before any new live
+    /// bytes arrive — a refresh or transient network blip is invisible
+    /// from the user's perspective. Serialised as a JSON array of bytes
+    /// (0–255) — readable, debuggable in DevTools, and the small
+    /// overhead is fine because we cap the buffer at 256 KiB.
+    scrollback: Vec<u8>,
 }
+
 
 fn encode_tab_bytes(tab_id: TabId, body: Bytes) -> Bytes {
     let mut buf = BytesMut::with_capacity(TAB_ID_PREFIX_LEN + body.len());
@@ -110,7 +119,12 @@ async fn run_inner(socket: WebSocket, state: ServerState) -> Result<()> {
 
     // Send the current roster to the new socket.
     let roster = collect_roster(&state).await;
-    send_json(&mut sender, ServerMessage::Hello { tabs: roster }).await?;
+    send_json(&mut sender, ServerMessage::Hello { tabs: roster.clone() }).await?;
+    // Replay per-tab scrollback as the same kind of tab-id-prefixed
+    // binary frames the forwarders emit. A fresh client gets the saved
+    // state before *any* live byte is pushed; live output follows on
+    // its heels via the per-tab forwarders spawned right after.
+    replay_scrollback(&mut sender, &roster).await?;
 
     // Fan-in: per-tab forwarders push Message frames into this
     // unbounded mpsc; the main loop drains it onto the WS. The mpsc
@@ -331,6 +345,41 @@ async fn send_json(
     Ok(())
 }
 
+async fn collect_roster(state: &ServerState) -> Vec<HelloTab> {
+    let tabs = state.tabs().lock().await;
+    let mut out: Vec<HelloTab> = Vec::with_capacity(tabs.len());
+    for (&id, rec) in tabs.iter() {
+        out.push(HelloTab {
+            tab_id: id,
+            label: rec.label.clone(),
+            scrollback: rec.pty.scrollback(),
+        });
+    }
+    // Stable order so the client renders the strip deterministically;
+    // also matches creation order (id monotonically increasing).
+    out.sort_by_key(|t| t.tab_id);
+    out
+}
+
+/// Replay the per-tab scrollback to a fresh client as a sequence of
+/// `tab_id`-prefixed binary frames identical in shape to the live
+/// forwarder's output. The client uses the same decode path to seed
+/// each new `Terminal` instance with the saved bytes, so the user's
+/// shell state survives a WS reconnect (refresh, transient blip, etc).
+async fn replay_scrollback(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    tabs: &[HelloTab],
+) -> Result<()> {
+    for tab in tabs {
+        if tab.scrollback.is_empty() {
+            continue;
+        }
+        let frame = encode_tab_bytes(tab.tab_id, Bytes::from(tab.scrollback.clone()));
+        sender.send(Message::Binary(frame)).await?;
+    }
+    Ok(())
+}
+
 async fn ensure_first_tab(state: &ServerState) -> Result<()> {
     let mut tabs = state.tabs().lock().await;
     if !tabs.is_empty() {
@@ -348,21 +397,6 @@ async fn ensure_first_tab(state: &ServerState) -> Result<()> {
     let pty = PtySession::spawn(state.shell(), state.shell_args(), None, 80, 24)?;
     tabs.insert(tab_id, TabRecord { label, pty });
     Ok(())
-}
-
-async fn collect_roster(state: &ServerState) -> Vec<HelloTab> {
-    let tabs = state.tabs().lock().await;
-    let mut out: Vec<HelloTab> = Vec::with_capacity(tabs.len());
-    for (&id, rec) in tabs.iter() {
-        out.push(HelloTab {
-            tab_id: id,
-            label: rec.label.clone(),
-        });
-    }
-    // Stable order so the client renders the strip deterministically;
-    // also matches creation order (id monotonically increasing).
-    out.sort_by_key(|t| t.tab_id);
-    out
 }
 
 #[cfg(test)]
@@ -453,21 +487,24 @@ mod tests {
                 HelloTab {
                     tab_id: 1,
                     label: "Terminal 1".to_string(),
+                    scrollback: vec![0x1b, b'[', b'3', b'2', b'm'],
                 },
                 HelloTab {
                     tab_id: 2,
                     label: "build".to_string(),
+                    scrollback: Vec::new(),
                 },
             ],
         };
         let json = serde_json::to_string(&msg).unwrap();
-        // Kebab-case type, tabs array with id+label fields. We assert
-        // the shape directly rather than re-parsing so the test fails
-        // loudly if the kebab-case tag renames a future contributor
-        // expects.
+        // Kebab-case type, tabs array with id+label fields, scrollback
+        // serialised as a JSON byte array. Empty scrollback must emit
+        // `[]` not `null`.
         assert!(json.contains(r#""type":"hello""#));
         assert!(json.contains(r#""tab_id":1"#));
         assert!(json.contains(r#""label":"build""#));
+        assert!(json.contains("[27,91,51,50,109]"));
+        assert!(json.contains("\"scrollback\":[]"));
     }
 
     #[test]
